@@ -1,0 +1,391 @@
+"""
+PerryPicks Brand Voice and Content Styling
+
+Ensures consistent voice, branding, and formatting across all platform outputs.
+
+Brand Guidelines:
+- Confident but not arrogant
+- Data-driven insights with accessible language
+- Clear betting recommendations with reasoning
+- Consistent emoji usage and formatting
+
+Usage:
+    from src.automation.brand_voice import BrandVoice
+
+    brand = BrandVoice()
+    content = brand.format_halftime_post(prediction, recommendations)
+"""
+
+import logging
+import random
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BrandConfig:
+    """Configuration for brand voice."""
+    name: str = "Perry"
+    tagline: str = "Powered by REPTAR"
+    emoji_header: str = "FIRE"  # Options: FIRE, CHART, BASKETBALL, TROPHY
+    include_disclaimer: bool = True
+    confidence_style: str = "tier"  # Options: tier, percentage, both
+
+
+class BrandVoice:
+    """
+    Generates branded content with consistent voice.
+
+    The Perry persona:
+    - Knowledgeable basketball analyst
+    - Data-focused but accessible
+    - Confident recommendations with clear reasoning
+    - Occasional wit without being unprofessional
+    """
+
+    EMOJI_HEADERS = {
+        "FIRE": "HALFTIME PREDICTION",
+        "CHART": "MODEL PROJECTION",
+        "BASKETBALL": "GAME ANALYSIS",
+        "TROPHY": "WINNER ALERT",
+    }
+
+    CONFIDENCE_TIERS = {
+        "A": {"emoji": "🎯", "label": "STRONG PLAY", "min_prob": 0.65},
+        "B+": {"emoji": "✅", "label": "SOLID PLAY", "min_prob": 0.58},
+        "B": {"emoji": "👍", "label": "MODERATE", "min_prob": 0.52},
+        "C": {"emoji": "⚠️", "label": "LEAN", "min_prob": 0.50},
+    }
+
+    # Phrases for Perry's Take section
+    TAKE_OPENERS = [
+        "Here's the breakdown:",
+        "My read on this:",
+        "Key insight:",
+        "Bottom line:",
+        "The story here:",
+    ]
+
+    TAKE_CLOSES = [
+        "Trust the model on this one.",
+        "Model says take it.",
+        "Value on this side.",
+        "Edge is clear.",
+        "Proceed with confidence.",
+        "Stay disciplined - this is the play.",
+        "Good spot here.",
+    ]
+
+    def __init__(self, config: Optional[BrandConfig] = None):
+        self.config = config or BrandConfig()
+
+    def format_halftime_post(
+        self,
+        away_tricode: str,
+        home_tricode: str,
+        h1_away: int,
+        h1_home: int,
+        prediction: dict,
+        recommendations: List[dict],
+        efficiency_stats: Optional[dict] = None,
+        odds: Optional[dict] = None,
+    ) -> str:
+        """
+        Format a complete halftime prediction post.
+
+        Args:
+            away_tricode: Away team code (e.g., "BOS")
+            home_tricode: Home team code
+            h1_away: Away team first half score
+            h1_home: Home team first half score
+            prediction: Dict with prediction values
+            recommendations: List of betting recommendations
+            efficiency_stats: Optional efficiency stats
+            odds: Optional odds data
+
+        Returns:
+            Formatted message string
+        """
+        lines = []
+
+        # Header
+        header_emoji = self._get_header_emoji()
+        lines.append(f"{header_emoji} **{self.EMOJI_HEADERS[self.config.emoji_header]}**")
+        lines.append("")
+
+        # Game header
+        lines.append(f"**{away_tricode} @ {home_tricode}** | {h1_away}-{h1_home} at the break")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        # Model projection
+        pred_total = prediction.get("pred_final_total", 0)
+        pred_margin = prediction.get("pred_final_margin", 0)
+        home_win_prob = prediction.get("home_win_prob", 0.5)
+
+        # Calculate projected scores
+        pred_home_score = (pred_total + pred_margin) / 2
+        pred_away_score = (pred_total - pred_margin) / 2
+
+        # Determine winner
+        if pred_margin > 0:
+            winner_team = home_tricode
+            winner_prob = home_win_prob
+        else:
+            winner_team = away_tricode
+            winner_prob = 1 - home_win_prob
+
+        lines.append(f"**{self.config.tagline.upper()} MODEL PROJECTION**")
+        lines.append(f"Final: {away_tricode} {pred_away_score:.0f} - {home_tricode} {pred_home_score:.0f}")
+        lines.append(f"Total: {pred_total:.1f} | Margin: {winner_team} {abs(pred_margin):.1f}")
+        lines.append(f"Win Probability: {winner_team} **{winner_prob:.0%}**")
+
+        # Confidence intervals
+        if prediction.get("total_q10") and prediction.get("total_q90"):
+            lines.append(f"80% CI (Total): {prediction['total_q10']:.0f} - {prediction['total_q90']:.0f}")
+
+        # Live efficiency stats
+        if efficiency_stats:
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            lines.append("**LIVE EFFICIENCY (1H)**")
+
+            home_efg = efficiency_stats.get("home_efg", 0) * 100
+            home_tor = efficiency_stats.get("home_tor", 0) * 100
+            away_efg = efficiency_stats.get("away_efg", 0) * 100
+            away_tor = efficiency_stats.get("away_tor", 0) * 100
+
+            lines.append(f"{home_tricode}: eFG {home_efg:.1f}% | TOR {home_tor:.1f}%")
+            lines.append(f"{away_tricode}: eFG {away_efg:.1f}% | TOR {away_tor:.1f}%")
+
+        # Betting recommendations
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("**BETTING RECOMMENDATIONS**")
+
+        for rec in recommendations:
+            formatted_rec = self._format_recommendation(rec, odds)
+            lines.append(formatted_rec)
+            lines.append("")
+
+        if not recommendations:
+            lines.append("*No strong edges detected - pass on this game*")
+            lines.append("")
+
+        # Perry's Take
+        lines.append("---")
+        lines.append("")
+        lines.append(f"**{self.config.name.upper()}'S TAKE**")
+        lines.append(self._generate_take(prediction, recommendations, efficiency_stats, home_tricode, away_tricode))
+
+        # Disclaimer
+        if self.config.include_disclaimer:
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            lines.append("*Bet responsibly. All picks for entertainment purposes only.*")
+
+        return "\n".join(lines)
+
+    def _get_header_emoji(self) -> str:
+        """Get header emoji based on config."""
+        emoji_map = {
+            "FIRE": "🔥",
+            "CHART": "📊",
+            "BASKETBALL": "🏀",
+            "TROPHY": "🏆",
+        }
+        return emoji_map.get(self.config.emoji_header, "🔥")
+
+    def _format_recommendation(self, rec: dict, odds: Optional[dict]) -> str:
+        """Format a single betting recommendation."""
+        tier = rec.get("confidence_tier", "B")
+        tier_info = self.CONFIDENCE_TIERS.get(tier, self.CONFIDENCE_TIERS["B"])
+
+        pick = rec.get("pick", "")
+        edge = rec.get("edge", 0)
+        prob = rec.get("probability", 0)
+        bet_type = rec.get("bet_type", "unknown")
+        odds_str = f" ({rec.get('odds')})" if rec.get("odds") else ""
+
+        # Format edge string
+        if bet_type == "ml":
+            edge_str = f"Edge: {edge:.0%}"
+        else:
+            edge_str = f"Edge: {edge:+.1f} pts"
+
+        # Format probability label
+        prob_label = {
+            "total": "Hit Prob",
+            "spread": "Cover Prob",
+            "ml": "Win Prob",
+        }.get(bet_type, "Prob")
+
+        lines = [
+            f"{tier_info['emoji']} **{pick.upper()}**{odds_str}",
+            f"{edge_str} | {prob_label}: {prob:.1%} | **{tier_info['label']}**",
+        ]
+
+        return "\n".join(lines)
+
+    def _generate_take(
+        self,
+        prediction: dict,
+        recommendations: List[dict],
+        efficiency_stats: Optional[dict],
+        home_tricode: str,
+        away_tricode: str,
+    ) -> str:
+        """Generate Perry's Take summary."""
+        parts = []
+
+        # Opening
+        parts.append(random.choice(self.TAKE_OPENERS))
+
+        # Game analysis
+        pred_margin = prediction.get("pred_final_margin", 0)
+        home_win_prob = prediction.get("home_win_prob", 0.5)
+
+        if abs(pred_margin) <= 3:
+            parts.append("Tight game projected.")
+        elif abs(pred_margin) <= 7:
+            parts.append("Moderate spread expected.")
+        else:
+            winner = home_tricode if pred_margin > 0 else away_tricode
+            parts.append(f"Clear edge to {winner}.")
+
+        # Top recommendation analysis
+        if recommendations:
+            top_rec = max(recommendations, key=lambda r: r.get("probability", 0))
+            pick = top_rec.get("pick", "")
+            tier = top_rec.get("confidence_tier", "B")
+            edge = top_rec.get("edge", 0)
+            bet_type = top_rec.get("bet_type", "")
+
+            edge_desc = f"{abs(edge):.1f}-point edge" if bet_type != "ml" else f"{abs(edge):.0%} edge"
+
+            if tier == "A":
+                parts.append(f"The {edge_desc} on {pick} is strong.")
+            else:
+                parts.append(f"Moderate edge on {pick}.")
+
+        # Efficiency insights
+        if efficiency_stats:
+            home_efg = efficiency_stats.get("home_efg", 0) * 100
+            away_efg = efficiency_stats.get("away_efg", 0) * 100
+            home_tor = efficiency_stats.get("home_tor", 0) * 100
+            away_tor = efficiency_stats.get("away_tor", 0) * 100
+
+            if home_efg >= 58:
+                parts.append(f"{home_tricode}'s eFG ({home_efg:.1f}%) is elite.")
+            if away_efg >= 58:
+                parts.append(f"{away_tricode}'s eFG ({away_efg:.1f}%) is elite.")
+            if home_tor >= 18:
+                parts.append(f"{home_tricode}'s turnover rate ({home_tor:.1f}%) is concerning.")
+            if away_tor >= 18:
+                parts.append(f"{away_tricode}'s turnover rate ({away_tor:.1f}%) is concerning.")
+
+        # Closing
+        if recommendations:
+            top_recs = [r for r in recommendations if r.get("confidence_tier") == "A"]
+            if top_recs:
+                picks_str = ", ".join([r.get("pick", "") for r in top_recs[:2]])
+                parts.append(f"Take {picks_str}.")
+            else:
+                parts.append(random.choice(self.TAKE_CLOSES))
+        else:
+            parts.append("No strong edges detected - pass on this game.")
+
+        return " ".join(parts)
+
+    def format_sgp_post(
+        self,
+        away_tricode: str,
+        home_tricode: str,
+        legs: List[dict],
+        combined_prob: float,
+    ) -> str:
+        """
+        Format a Same Game Parlay suggestion.
+
+        Args:
+            away_tricode: Away team code
+            home_tricode: Home team code
+            legs: List of parlay legs
+            combined_prob: Combined probability estimate
+
+        Returns:
+            Formatted SGP message
+        """
+        lines = []
+
+        lines.append("**SAME GAME PARLAY OPPORTUNITY**")
+        lines.append("")
+        lines.append(f"**{away_tricode} @ {home_tricode}**")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("**SGP LEGS:**")
+
+        for i, leg in enumerate(legs, 1):
+            pick = leg.get("pick", "")
+            tier = leg.get("confidence_tier", "B")
+            prob = leg.get("probability", 0)
+            tier_info = self.CONFIDENCE_TIERS.get(tier, self.CONFIDENCE_TIERS["B"])
+            lines.append(f"{i}. {tier_info['emoji']} {pick} ({tier}, {prob:.0%})")
+
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append(f"**Combined Probability:** ~{combined_prob:.0%}")
+        lines.append("")
+        lines.append("*SGPs are high-risk, high-reward. Size accordingly.*")
+
+        return "\n".join(lines)
+
+    def format_high_confidence_alert(
+        self,
+        away_tricode: str,
+        home_tricode: str,
+        pick: str,
+        prob: float,
+        tier: str,
+    ) -> str:
+        """
+        Format a high confidence alert.
+
+        Args:
+            away_tricode: Away team code
+            home_tricode: Home team code
+            pick: The recommended pick
+            prob: Probability/confidence
+            tier: Confidence tier
+
+        Returns:
+            Formatted alert message
+        """
+        tier_info = self.CONFIDENCE_TIERS.get(tier, self.CONFIDENCE_TIERS["B"])
+
+        lines = [
+            "**HIGH CONFIDENCE ALERT**",
+            "",
+            f"{tier_info['emoji']} **{pick.upper()}**",
+            f"{away_tricode} @ {home_tricode}",
+            "",
+            f"**{tier_info['label']}** | {prob:.0%} confidence",
+            "",
+            "---",
+            "",
+            "Don't miss this one.",
+        ]
+
+        return "\n".join(lines)
+
+
+__all__ = ["BrandVoice", "BrandConfig"]

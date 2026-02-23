@@ -1,0 +1,191 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --cc-bg: #0a0e17;
+  --cc-surface: #111827;
+  --cc-card: #1a2332;
+  --cc-border: #2a3548;
+  --cc-text: #e2e8f0;
+  --cc-muted: #64748b;
+  --cc-accent: #3b82f6;
+  --cc-green: #22c55e;
+  --cc-red: #ef4444;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'IBM Plex Mono', monospace;
+  background-color: var(--cc-bg);
+  color: var(--cc-text);
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--cc-surface);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--cc-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--cc-muted);
+}
+
+/* Command center glow effects */
+@layer components {
+  .cc-panel {
+    @apply bg-cc-card border border-cc-border rounded-lg p-4;
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.05);
+  }
+
+  .cc-panel-glow {
+    @apply cc-panel;
+    box-shadow: 0 0 30px rgba(59, 130, 246, 0.1);
+  }
+
+  .cc-stat {
+    @apply flex flex-col;
+  }
+
+  .cc-stat-label {
+    @apply text-cc-muted text-xs uppercase tracking-wider mb-1;
+  }
+
+  .cc-stat-value {
+    @apply text-2xl font-bold font-mono;
+  }
+
+  .cc-stat-positive {
+    @apply text-cc-green;
+  }
+
+  .cc-stat-negative {
+    @apply text-cc-red;
+  }
+
+  .cc-btn {
+    @apply px-4 py-2 rounded font-medium transition-all duration-200;
+    @apply border border-cc-border bg-cc-surface hover:bg-cc-card;
+    @apply focus:outline-none focus:ring-2 focus:ring-cc-accent focus:ring-offset-2 focus:ring-offset-cc-bg;
+  }
+
+  .cc-btn-primary {
+    @apply cc-btn bg-cc-accent border-cc-accent text-white;
+    @apply hover:bg-blue-600;
+  }
+
+  .cc-btn-success {
+    @apply cc-btn bg-cc-green border-cc-green text-white;
+    @apply hover:bg-green-600;
+  }
+
+  .cc-btn-danger {
+    @apply cc-btn bg-cc-red border-cc-red text-white;
+    @apply hover:bg-red-600;
+  }
+
+  .cc-input {
+    @apply px-3 py-2 rounded border border-cc-border bg-cc-surface text-cc-text;
+    @apply focus:outline-none focus:ring-2 focus:ring-cc-accent focus:border-transparent;
+  }
+
+  .cc-badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .cc-badge-success {
+    @apply bg-cc-green/20 text-cc-green;
+  }
+
+  .cc-badge-danger {
+    @apply bg-cc-red/20 text-cc-red;
+  }
+
+  .cc-badge-warning {
+    @apply bg-cc-yellow/20 text-cc-yellow;
+  }
+
+  .cc-badge-info {
+    @apply bg-cc-accent/20 text-cc-accent;
+  }
+
+  .cc-table {
+    @apply w-full;
+  }
+
+  .cc-table th {
+    @apply text-left text-xs uppercase tracking-wider text-cc-muted pb-2 border-b border-cc-border;
+  }
+
+  .cc-table td {
+    @apply py-2 border-b border-cc-border/50;
+  }
+
+  .cc-table tr:hover td {
+    @apply bg-cc-surface/50;
+  }
+}
+
+/* Animations */
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.1);
+  }
+  50% {
+    box-shadow: 0 0 30px rgba(59, 130, 246, 0.2);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+/* Live indicator */
+.live-dot {
+  width: 8px;
+  height: 8px;
+  background-color: var(--cc-green);
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(34, 197, 94, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+  }
+}

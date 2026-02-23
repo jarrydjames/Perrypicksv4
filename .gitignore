@@ -1,0 +1,49 @@
+# Environment variables (contains API keys)
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Node/Frontend
+node_modules/
+.npm
+*.log
+npm-debug.log*
+
+# Cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+.perrypicks.pid
+*.pid
+
+# Logs
+logs/
+*.log
+/tmp/
+
+# Databases (runtime data)
+*.db
+*.sqlite
+*.sqlite3

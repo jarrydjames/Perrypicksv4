@@ -1,0 +1,10 @@
+requests
+pandas
+numpy
+scipy
+scikit-learn
+joblib
+pyarrow
+nba_api
+xgboost
+lightgbm
