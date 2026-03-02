@@ -187,7 +187,7 @@ class MaximusPregamePoster:
 
         now_utc = datetime.now(timezone.utc)
         min_minutes = float(os.environ.get("MAXIMUS_PREGAME_POST_MIN_MINUTES_BEFORE_TIP", "10"))
-        min_tip_utc = now_utc + timedelta(minutes=min_minutes)
+        max_tip_utc = now_utc + timedelta(minutes=min_minutes)
 
         db = SessionLocal()
         try:
@@ -209,7 +209,7 @@ class MaximusPregamePoster:
             pending = []
             for pred, game in candidates:
                 tip_utc = as_utc_from_league_local(game.game_date)
-                if tip_utc >= min_tip_utc:
+                if tip_utc <= max_tip_utc:
                     pending.append((pred, game))
                 if len(pending) >= self._cfg.max_posts_per_tick:
                     break
