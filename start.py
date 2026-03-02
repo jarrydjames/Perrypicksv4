@@ -59,6 +59,7 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 # =============================================================================
 
 PID_FILE = Path(__file__).parent / ".perrypicks.pid"
+HEARTBEAT_FILE = Path(__file__).parent / ".perrypicks.heartbeat"
 LOCK_ACQUIRED = False
 
 
@@ -80,6 +81,18 @@ def acquire_lock() -> bool:
     """
     global LOCK_ACQUIRED
 
+    # Clean up old cleanup files (more than 1 minute old)
+    # These are created during graceful shutdown and should be cleaned up
+    for cleanup_file in Path.cwd().glob("*.pid.cleaning"):
+        try:
+            mtime = datetime.fromtimestamp(cleanup_file.stat().st_mtime)
+            age = datetime.now() - mtime
+            if age > timedelta(minutes=1):
+                logger.info(f"Removing old cleanup file: {cleanup_file}")
+                cleanup_file.unlink()
+        except:
+            pass
+
     # Check for existing PID file
     if PID_FILE.exists():
         try:
@@ -92,6 +105,25 @@ def acquire_lock() -> bool:
                 return False
             else:
                 # Stale PID file - process crashed without cleanup
+                # Add grace period to prevent race condition during cleanup
+                try:
+                    # Check file modification time
+                    mtime = datetime.fromtimestamp(PID_FILE.stat().st_mtime)
+                    age = datetime.now() - mtime
+                    
+                    # If PID file is less than 30 seconds old, wait for cleanup to complete
+                    if age < timedelta(seconds=30):
+                        logger.warning(f"Recent PID file (age: {age.total_seconds():.1f}s) - possible cleanup in progress")
+                        logger.warning(f"Waiting 5 seconds for cleanup to complete...")
+                        time.sleep(5)
+                        
+                        # Check again if process started
+                        if is_process_running(old_pid):
+                            logger.error(f"Process started during grace period - aborting")
+                            return False
+                except:
+                    pass
+                
                 logger.warning(f"Removing stale PID file (process {old_pid} no longer exists)")
                 PID_FILE.unlink()
         except (ValueError, OSError) as e:
@@ -110,15 +142,23 @@ def acquire_lock() -> bool:
 
 
 def release_lock():
-    """Release the single-instance lock."""
+    """Release the single-instance lock.
+    
+    IMPORTANT: Only remove PID file if this is the process that owns it.
+    This prevents race conditions during cleanup.
+    """
     global LOCK_ACQUIRED
 
     if LOCK_ACQUIRED and PID_FILE.exists():
         try:
             current_pid = int(PID_FILE.read_text().strip())
+            # Only remove PID file if we own it
             if current_pid == os.getpid():
-                PID_FILE.unlink()
-                logger.info("Released process lock")
+                # Don't remove immediately - let new instances wait for grace period
+                # Move to temporary name instead
+                temp_file = PID_FILE.with_suffix('.pid.cleaning')
+                PID_FILE.rename(temp_file)
+                logger.info("Released process lock (moved to cleanup file)")
         except (ValueError, OSError):
             pass
     LOCK_ACQUIRED = False
@@ -186,6 +226,8 @@ class PerryPicksOrchestrator:
         self._fired_triggers: Set[str] = set()  # game_id:trigger_type
         self._threads: List[threading.Thread] = []
         self._last_data_refresh: Optional[datetime] = None
+        self._last_report_card_date: Optional[str] = None  # Track last report card date (YYYY-MM-DD)
+        self._last_queue_date: Optional[str] = None  # Track last queue date for daily cleanup
         self._trigger_lock = threading.Lock()  # Lock for thread-safe trigger processing
 
         # Components (loaded lazily)
@@ -240,10 +282,13 @@ class PerryPicksOrchestrator:
             # 7. Initial data refresh
             self._refresh_data()
 
-            # 8. Queue pending triggers for today's games
+            # 8. Check for unposted predictions from previous runs (CRITICAL FIX)
+            self._retry_unposted_predictions()
+
+            # 9. Queue pending triggers for today's games
             self._queue_todays_games()
 
-            # 9. Start main automation loop
+            # 10. Start main automation loop
             self._run_automation_loop()
 
         except Exception as e:
@@ -327,6 +372,7 @@ class PerryPicksOrchestrator:
             main_webhook=os.environ.get("DISCORD_WEBHOOK_URL"),
             high_confidence_webhook=os.environ.get("DISCORD_HIGH_CONFIDENCE_WEBHOOK"),
             sgp_webhook=os.environ.get("DISCORD_SGP_WEBHOOK"),
+            report_card_webhook=os.environ.get("DISCORD_REPORT_CARD_WEBHOOK"),
             alerts_webhook=os.environ.get("DISCORD_ALERTS_WEBHOOK"),
             post_to_main_always=True,
         )
@@ -368,19 +414,22 @@ class PerryPicksOrchestrator:
         venv_python = odds_api_dir / ".venv" / "bin" / "python"
         python_cmd = str(venv_python) if venv_python.exists() else sys.executable
 
+        odds_log_path = Path(__file__).parent / "logs" / "odds_api_subprocess.log"
+        odds_log_fh = open(odds_log_path, "a", buffering=1)
+
         process = subprocess.Popen(
             [python_cmd, "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8890"],
             cwd=str(odds_api_dir),
-            stdout=subprocess.PIPE,
+            stdout=odds_log_fh,
             stderr=subprocess.STDOUT,
             env=env,
         )
         self._processes.append(process)
 
         # Wait for Odds API to be ready
-        time.sleep(3)
+        time.sleep(5)
         import requests
-        for attempt in range(15):
+        for attempt in range(60):
             try:
                 resp = requests.get("http://localhost:8890/v1/health", timeout=2)
                 if resp.status_code == 200:
@@ -393,7 +442,7 @@ class PerryPicksOrchestrator:
                 time.sleep(1)
 
         # CRITICAL FIX: Health check failed - don't use local API
-        logger.error("Odds API failed to start after 15 attempts - will use external API")
+        logger.error("Odds API failed to start after 60 attempts - will use external API")
         os.environ["USE_LOCAL_ODDS_API"] = "false"
         return False
 
@@ -401,13 +450,24 @@ class PerryPicksOrchestrator:
         """Start the FastAPI backend server."""
         logger.info(f"Starting backend API on port {self.backend_port}...")
 
-        backend_path = Path(__file__).parent / "dashboard" / "backend" / "main.py"
+        backend_log_path = Path(__file__).parent / "logs" / "backend_subprocess.log"
+        backend_log_fh = open(backend_log_path, "a", buffering=1)
 
         process = subprocess.Popen(
-            [sys.executable, str(backend_path)],
-            stdout=subprocess.PIPE,
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "dashboard.backend.main:app",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(self.backend_port),
+            ],
+            cwd=str(Path(__file__).parent),
+            stdout=backend_log_fh,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PORT": str(self.backend_port)},
+            env={**os.environ},
         )
         self._processes.append(process)
 
@@ -443,7 +503,7 @@ class PerryPicksOrchestrator:
 
     def _cleanup_stale_games(self):
         """Remove games from database that aren't in today's schedule."""
-        from dashboard.backend.database import SessionLocal, Game
+        from dashboard.backend.database import SessionLocal, Game, Prediction
         from src.schedule import fetch_schedule
 
         try:
@@ -463,6 +523,8 @@ class PerryPicksOrchestrator:
 
             if stale:
                 for g in stale:
+                    # Delete associated predictions first to avoid NOT NULL constraint
+                    db.query(Prediction).filter(Prediction.game_id == g.id).delete()
                     db.delete(g)
                 db.commit()
                 logger.info(f"Cleaned up {len(stale)} stale games from database")
@@ -470,6 +532,39 @@ class PerryPicksOrchestrator:
             db.close()
         except Exception as e:
             logger.warning(f"Failed to cleanup stale games: {e}")
+
+    def _retry_unposted_predictions(self):
+        """Retry any unposted predictions from previous runs.
+
+        CRITICAL: This ensures predictions that failed to post get retried
+        even after process restart.
+        """
+        from dashboard.backend.database import SessionLocal, Prediction, Game, PredictionStatus
+
+        try:
+            db = SessionLocal()
+            # Find unposted predictions from today
+            today_start = datetime(date.today().year, date.today().month, date.today().day)
+            unposted = db.query(Prediction).join(Game).filter(
+                Game.game_date >= today_start,
+                Prediction.posted_to_discord == False,
+                Prediction.status == PredictionStatus.PENDING
+            ).all()
+
+            if unposted:
+                logger.warning(f"Found {len(unposted)} unposted predictions - these will be retried")
+                # Delete them so they can be recreated fresh
+                for pred in unposted:
+                    logger.info(f"Deleting unposted prediction {pred.id} for game {pred.game_id}")
+                    db.delete(pred)
+                db.commit()
+                logger.info("Unposted predictions cleared - will be recreated on next trigger")
+            else:
+                logger.debug("No unposted predictions found")
+
+            db.close()
+        except Exception as e:
+            logger.warning(f"Failed to check unposted predictions: {e}")
 
     def _refresh_data(self):
         """Refresh any data needed on startup."""
@@ -498,9 +593,17 @@ class PerryPicksOrchestrator:
 
                     existing = db.query(Game).filter(Game.nba_id == nba_id).first()
                     if not existing:
+                        # Parse game date from ESPN data (ISO format: 2026-02-28T00:00Z)
+                        date_time_str = game_data.get("date_time", "")
+                        if date_time_str:
+                            game_datetime = datetime.fromisoformat(date_time_str.replace("Z", "+00:00"))
+                        else:
+                            # Fallback to current time if no date provided
+                            game_datetime = datetime.utcnow()
+
                         game = Game(
                             nba_id=nba_id,
-                            game_date=datetime.utcnow(),
+                            game_date=game_datetime,
                             home_team=game_data.get("home_team", ""),
                             away_team=game_data.get("away_team", ""),
                             home_team_name=game_data.get("home_name"),
@@ -529,6 +632,16 @@ class PerryPicksOrchestrator:
         # Use local date (games are scheduled in Eastern time)
         today = date.today().strftime("%Y-%m-%d")
 
+        # DAILY CLEANUP: Clear triggers and threads for new day
+        # This prevents memory leaks from accumulating over days
+        if hasattr(self, '_last_queue_date') and self._last_queue_date != today:
+            logger.info("New day detected - clearing old triggers and threads")
+            self._pending_triggers.clear()
+            self._fired_triggers.clear()
+            # Clean up finished threads
+            self._threads = [t for t in self._threads if t.is_alive()]
+        self._last_queue_date = today
+
         try:
             schedule = fetch_schedule(today)
             games = schedule.get("games", [])
@@ -538,19 +651,27 @@ class PerryPicksOrchestrator:
                 if not nba_id:
                     continue
 
-                # Queue halftime trigger
-                self._pending_triggers.append(PendingTrigger(
-                    game_id=nba_id,
-                    trigger_type="halftime",
-                    queued_at=datetime.utcnow(),
-                ))
+                # Skip if already queued (prevents duplicates on refresh)
+                trigger_key_halftime = f"{nba_id}:halftime"
+                trigger_key_q3 = f"{nba_id}:q3_5min"
+                existing_keys = {f"{t.game_id}:{t.trigger_type}" for t in self._pending_triggers}
 
-                # Queue Q3 5min trigger
-                self._pending_triggers.append(PendingTrigger(
-                    game_id=nba_id,
-                    trigger_type="q3_5min",
-                    queued_at=datetime.utcnow(),
-                ))
+                if trigger_key_halftime not in existing_keys and trigger_key_halftime not in self._fired_triggers:
+                    # Queue halftime trigger
+                    self._pending_triggers.append(PendingTrigger(
+                        game_id=nba_id,
+                        trigger_type="halftime",
+                        queued_at=datetime.utcnow(),
+                    ))
+
+                # Q3 TRIGGER DISABLED - model not configured yet
+                # if trigger_key_q3 not in existing_keys and trigger_key_q3 not in self._fired_triggers:
+                #     # Queue Q3 5min trigger
+                #     self._pending_triggers.append(PendingTrigger(
+                #         game_id=nba_id,
+                #         trigger_type="q3_5min",
+                #         queued_at=datetime.utcnow(),
+                #     ))
 
             logger.info(f"Queued {len(self._pending_triggers)} pending triggers for {len(games)} games")
 
@@ -565,11 +686,54 @@ class PerryPicksOrchestrator:
         'GS': 'GSW',   # Golden State
         'NY': 'NYK',   # New York
         'NO': 'NOP',   # New Orleans
+        'UTAH': 'UTA', # Utah Jazz (ESPN returns full name)
+        'BKN': 'BKN',  # Brooklyn (already correct)
+        'BK': 'BKN',   # Brooklyn (alternate)
+    }
+
+    # Mapping from tricodes to full team names (for odds API)
+    TRICODE_TO_FULL_NAME = {
+        'ATL': 'Atlanta Hawks',
+        'BOS': 'Boston Celtics',
+        'BKN': 'Brooklyn Nets',
+        'CHA': 'Charlotte Hornets',
+        'CHI': 'Chicago Bulls',
+        'CLE': 'Cleveland Cavaliers',
+        'DAL': 'Dallas Mavericks',
+        'DEN': 'Denver Nuggets',
+        'DET': 'Detroit Pistons',
+        'GSW': 'Golden State Warriors',
+        'HOU': 'Houston Rockets',
+        'IND': 'Indiana Pacers',
+        'LAC': 'Los Angeles Clippers',
+        'LAL': 'Los Angeles Lakers',
+        'MEM': 'Memphis Grizzlies',
+        'MIA': 'Miami Heat',
+        'MIL': 'Milwaukee Bucks',
+        'MIN': 'Minnesota Timberwolves',
+        'NOP': 'New Orleans Pelicans',
+        'NYK': 'New York Knicks',
+        'OKC': 'Oklahoma City Thunder',
+        'ORL': 'Orlando Magic',
+        'PHI': 'Philadelphia 76ers',
+        'PHO': 'Phoenix Suns',  # NBA CDN uses PHO
+        'POR': 'Portland Trail Blazers',
+        'SAC': 'Sacramento Kings',
+        'SAS': 'San Antonio Spurs',
+        'TOR': 'Toronto Raptors',
+        'UTA': 'Utah Jazz',
+        'WAS': 'Washington Wizards',
     }
 
     def _normalize_tricode(self, code):
         """Normalize tricode to match NBA CDN format."""
         return self.TRICODE_MAP.get(code, code)
+
+    def _tricode_to_full_name(self, tricode: str) -> str:
+        """Convert tricode to full team name for odds API."""
+        if not tricode:
+            return "UNKNOWN"
+        return self.TRICODE_TO_FULL_NAME.get(tricode.upper(), tricode)
 
     def _update_game_statuses(self):
         """Update game statuses from ESPN scoreboard."""
@@ -632,40 +796,26 @@ class PerryPicksOrchestrator:
                     home_team_norm = self._normalize_tricode(home_team)
                     away_team_norm = self._normalize_tricode(away_team)
 
-                    # Find existing game by team tricodes
+                    # CRITICAL FIX: Match by tricodes first (most reliable)
+                    # Use date filter to ensure we get today's game
                     game = db.query(Game).filter(
                         Game.home_team == home_team_norm,
-                        Game.away_team == away_team_norm
+                        Game.away_team == away_team_norm,
+                        Game.game_date >= datetime(date_type.today().year, date_type.today().month, date_type.today().day)
                     ).first()
 
-                    # Also try with team names if not found
-                    if not game:
-                        game = db.query(Game).filter(
-                            Game.home_team_name == home_name,
-                            Game.away_team_name == away_name
-                        ).first()
-
-                    # Try partial name matching (e.g., "Houston" in "Houston Rockets")
-                    if not game:
-                        all_games = db.query(Game).filter(
-                            Game.game_date >= datetime(date_type.today().year, date_type.today().month, date_type.today().day)
-                        ).all()
-                        for g in all_games:
-                            # Check if team names contain the city name
-                            home_match = (home_name and g.home_team_name and home_name in g.home_team_name) or \
-                                        (g.home_team_name and g.home_team_name in home_name) if home_name else False
-                            away_match = (away_name and g.away_team_name and away_name in g.away_team_name) or \
-                                        (g.away_team_name and g.away_team_name in away_name) if away_name else False
-                            if home_match and away_match:
-                                game = g
-                                break
-
-                    # Also try matching by tricodes only (for games without full team names)
+                    # If not found, try without date filter (for edge cases)
                     if not game:
                         game = db.query(Game).filter(
                             Game.home_team == home_team_norm,
-                            Game.away_team == away_team_norm,
-                            Game.game_date >= datetime(date_type.today().year, date_type.today().month, date_type.today().day)
+                            Game.away_team == away_team_norm
+                        ).first()
+
+                    # Only try team names as last resort (often None in our DB)
+                    if not game and home_name and away_name:
+                        game = db.query(Game).filter(
+                            Game.home_team_name == home_name,
+                            Game.away_team_name == away_name
                         ).first()
 
                     if not game:
@@ -731,6 +881,15 @@ class PerryPicksOrchestrator:
         except Exception as e:
             logger.debug(f"Failed to update game statuses: {e}")
 
+    def _check_and_queue_games(self):
+        """Check if date changed and re-queue games if needed."""
+        from datetime import date
+        today = date.today().strftime("%Y-%m-%d")
+        
+        if self._last_queue_date != today:
+            logger.info(f"Date changed from {self._last_queue_date} to {today}, re-queuing games")
+            self._queue_todays_games()
+
     def _run_automation_loop(self):
         """Main automation loop - checks triggers and processes them."""
         logger.info("Starting automation loop...")
@@ -739,27 +898,59 @@ class PerryPicksOrchestrator:
         logger.info(f"Temporal data will refresh daily at {self.DATA_REFRESH_HOUR}:00 CST and every {self.DATA_REFRESH_INTERVAL_HOURS} hours")
         logger.info("Live bet tracking enabled for Q3/Q4 games")
 
+        try:
+            HEARTBEAT_FILE.write_text(datetime.utcnow().isoformat())
+        except Exception:
+            pass
+
         iteration = 0
         while self._running:
             try:
+                try:
+                    HEARTBEAT_FILE.write_text(datetime.utcnow().isoformat())
+                except Exception:
+                    pass
+
                 # Update game statuses every 2 iterations (60s with 30s interval)
                 if iteration % 2 == 0:
                     self._update_game_statuses()
+                    # Resolve bets for completed games
+                    self._resolve_bets()
 
                 # Check if we should refresh temporal data
                 if self._should_refresh_data():
                     logger.info("Starting scheduled temporal data refresh...")
                     self._refresh_temporal_data()
 
+                # Check if we should post daily report card (6 AM CST / 12:00 UTC)
+                if self._should_post_report_card():
+                    logger.info("Posting daily report card...")
+                    self._post_daily_report_card()
+
                 # Run live bet tracking every 4 iterations (2 minutes with 30s interval)
                 if iteration % 4 == 0:
                     self._run_live_tracking()
+
+                # Clean up finished threads every 10 iterations (5 minutes)
+                if iteration % 10 == 0:
+                    alive_count = len([t for t in self._threads if t.is_alive()])
+                    if alive_count < len(self._threads):
+                        self._threads = [t for t in self._threads if t.is_alive()]
+                        logger.debug(f"Cleaned up {len(self._threads) - alive_count} finished threads")
+
+                # Check if date changed and re-queue games (every 2 minutes)
+                if iteration % 4 == 0:
+                    self._check_and_queue_games()
 
                 self._poll_and_process()
                 iteration += 1
                 time.sleep(self.POLL_INTERVAL)
             except Exception as e:
                 logger.error(f"Error in automation loop: {e}")
+                try:
+                    HEARTBEAT_FILE.write_text(datetime.utcnow().isoformat())
+                except Exception:
+                    pass
                 time.sleep(self.POLL_INTERVAL)
 
     def _should_refresh_data(self) -> bool:
@@ -802,6 +993,77 @@ class PerryPicksOrchestrator:
 
         except Exception as e:
             logger.error(f"Failed to refresh temporal data: {e}")
+
+    def _should_post_report_card(self) -> bool:
+        """Check if we should post the daily report card.
+
+        Posts at 6 AM CST (12:00 UTC) after all games from previous day are complete.
+        Only posts once per day.
+        """
+        from datetime import timezone
+
+        now = datetime.utcnow()
+        today_str = now.strftime("%Y-%m-%d")
+
+        # Already posted today
+        if self._last_report_card_date == today_str:
+            return False
+
+        # Check if it's 6 AM CST (12:00 UTC) or later
+        # Report card posts at 12:00 UTC (6 AM CST / 7 AM CDT)
+        if now.hour >= 12:
+            return True
+
+        return False
+
+    def _post_daily_report_card(self):
+        """Generate and post the daily report card to Discord."""
+        try:
+            from src.automation.report_card import generate_daily_report_card
+            from datetime import timedelta
+            # Always report on YESTERDAY's date
+            # Report cards are posted at 06:00 to summarize the previous day's results
+            # This ensures we don't accidentally report on today's games if they finished early
+            report_date = datetime.utcnow() - timedelta(days=1)
+            logger.info(f"Generating report card for yesterday: {report_date.strftime('%Y-%m-%d')}")
+
+            report = generate_daily_report_card(report_date)
+
+            # Post to report card channel
+            if hasattr(self, '_channel_router') and self._channel_router:
+                result = self._channel_router.post_report_card(report)
+                if result and result.success:
+                    logger.info("Daily report card posted successfully")
+                    self._last_report_card_date = datetime.utcnow().strftime("%Y-%m-%d")
+                else:
+                    error = result.error if result else "Unknown error"
+                    logger.error(f"Failed to post report card: {error}")
+            else:
+                logger.warning("No channel router available for report card")
+
+        except Exception as e:
+            logger.error(f"Failed to post daily report card: {e}")
+
+    def _resolve_bets(self):
+        """
+        Resolve betting recommendations and parlays for completed games.
+
+        Called after game statuses are updated. Resolves:
+        - BettingRecommendation records (total, spread, ML, team_total)
+        - Parlay records (based on leg results)
+        """
+        try:
+            from src.automation.bet_resolver import run_bet_resolution
+
+            resolved_bets, resolved_parlays, errors = run_bet_resolution()
+
+            if resolved_bets > 0 or resolved_parlays > 0:
+                logger.info(f"Bet resolution: {resolved_bets} bets, {resolved_parlays} parlays resolved")
+                if errors > 0:
+                    logger.warning(f"Bet resolution had {errors} errors")
+
+        except Exception as e:
+            logger.error(f"Failed to resolve bets: {e}")
 
     def _run_live_tracking(self):
         """
@@ -893,24 +1155,23 @@ class PerryPicksOrchestrator:
                 should_fire = self._check_trigger(trigger)
 
                 if should_fire:
-                    # Use lock to prevent race condition - only one thread can fire a trigger
-                    with self._trigger_lock:
-                        # Double-check after acquiring lock
-                        if trigger_key in self._fired_triggers:
-                            continue
+                    # Process triggers in PARALLEL - don't use lock that blocks other games
+                    # Check again without lock to prevent race condition
+                    if trigger_key in self._fired_triggers:
+                        continue
 
-                        logger.info(f"Trigger fired: {trigger_key}")
-                        trigger.fired = True
-                        self._fired_triggers.add(trigger_key)
+                    logger.info(f"Trigger fired: {trigger_key}")
+                    trigger.fired = True
+                    self._fired_triggers.add(trigger_key)
 
-                        # Process the trigger in a separate thread
-                        thread = threading.Thread(
-                            target=self._process_trigger,
-                            args=(trigger,),
-                            daemon=True,
-                        )
-                        thread.start()
-                        self._threads.append(thread)
+                    # Process trigger in a separate thread
+                    thread = threading.Thread(
+                        target=self._process_trigger,
+                        args=(trigger,),
+                        daemon=True,
+                    )
+                    thread.start()
+                    self._threads.append(thread)
 
             except Exception as e:
                 logger.error(f"Error checking trigger {trigger_key}: {e}")
@@ -974,12 +1235,18 @@ class PerryPicksOrchestrator:
         return False
 
     def _parse_clock_minutes(self, clock: str) -> int:
-        """Parse minutes from clock string (MM:SS)."""
+        """Parse minutes from clock string (MM:SS or M.M format)."""
         try:
             if not clock:
                 return 0
-            parts = clock.split(":")
-            return int(parts[0])
+            clock = clock.strip()
+            # Handle "MM:SS" format
+            if ":" in clock:
+                parts = clock.split(":")
+                return int(parts[0])
+            # Handle "M.M" decimal format (e.g., "2.1" = 2.1 minutes)
+            else:
+                return int(float(clock))
         except:
             return 0
 
@@ -994,7 +1261,7 @@ class PerryPicksOrchestrator:
         """
         from src.data.game_data import fetch_box, get_game_info, first_half_score, behavior_counts_1h, fetch_pbp_df, get_efficiency_stats_from_box
         from src.automation.post_generator import PostGenerator
-        from dashboard.backend.database import SessionLocal, Game, Prediction, BettingRecommendation, GhostBet, GhostBettorConfig, TriggerType as DBTriggerType, PredictionStatus
+        from dashboard.backend.database import SessionLocal, Game, Prediction, BettingRecommendation, GhostBet, GhostBettorConfig, TriggerType as DBTriggerType, PredictionStatus, BetType
         from src.odds import fetch_nba_odds_snapshot, OddsAPIError
 
         trigger_key = f"{trigger.game_id}:{trigger.trigger_type}"
@@ -1009,8 +1276,12 @@ class PerryPicksOrchestrator:
                 Prediction.trigger_type == trigger_type_enum
             ).first()
             if existing:
-                logger.warning(f"Prediction already exists for {trigger_key} (ID={existing.id}), skipping duplicate")
-                return
+                # If already posted, skip entirely
+                if existing.posted_to_discord:
+                    logger.warning(f"Prediction already posted for {trigger_key} (ID={existing.id}), skipping duplicate")
+                    return
+                # If not posted, update the existing prediction instead of creating new one
+                logger.info(f"Reposting unposted prediction {trigger_key} (ID={existing.id})")
         finally:
             db.close()
 
@@ -1025,9 +1296,20 @@ class PerryPicksOrchestrator:
                 # Get or create game record
                 game = db.query(Game).filter(Game.nba_id == trigger.game_id).first()
                 if not game:
+                    # Parse game time from box score (gameTimeUTC field)
+                    game_time_str = info.get("game_time", "")
+                    if game_time_str:
+                        # gameTimeUTC is in format: "2026-02-27T21:00:00Z"
+                        try:
+                            game_datetime = datetime.fromisoformat(game_time_str)
+                        except (ValueError, TypeError):
+                            game_datetime = datetime.utcnow()
+                    else:
+                        game_datetime = datetime.utcnow()
+
                     game = Game(
                         nba_id=trigger.game_id,
-                        game_date=datetime.utcnow(),
+                        game_date=game_datetime,
                         home_team=info.get("home_tricode", "HOME"),
                         away_team=info.get("away_tricode", "AWAY"),
                         home_team_name=info.get("home_name"),
@@ -1108,70 +1390,91 @@ class PerryPicksOrchestrator:
 
             # 3. Fetch odds - ONLY NOW when trigger fires!
             odds = None
-            home_name = info.get("home_name") or info.get("home_tricode")
-            away_name = info.get("away_name") or info.get("away_tricode")
+            # Use tricodes to get full team names for odds API
+            home_tricode = info.get("home_tricode", "HOME")
+            away_tricode = info.get("away_tricode", "AWAY")
+            home_name = self._tricode_to_full_name(home_tricode)
+            away_name = self._tricode_to_full_name(away_tricode)
+            logger.info(f"Converted tricodes to full names: {home_tricode} -> {home_name}, {away_tricode} -> {away_name}")
 
-            try:
-                logger.info(f"Fetching live odds for {home_name} vs {away_name}...")
-                snapshot = fetch_nba_odds_snapshot(
-                    home_name=home_name,
-                    away_name=away_name,
-                    timeout_s=60,  # Give DraftKings Live more time
-                )
-                odds = {
-                    "total_points": snapshot.total_points,
-                    "total_over_odds": snapshot.total_over_odds,
-                    "total_under_odds": snapshot.total_under_odds,
-                    "spread_home": snapshot.spread_home,
-                    "spread_home_odds": snapshot.spread_home_odds,
-                    "spread_away_odds": snapshot.spread_away_odds,
-                    "moneyline_home": snapshot.moneyline_home,
-                    "moneyline_away": snapshot.moneyline_away,
-                    "team_total_home": getattr(snapshot, 'team_total_home', None),
-                    "team_total_home_over_odds": getattr(snapshot, 'team_total_home_over_odds', None),
-                    "team_total_home_under_odds": getattr(snapshot, 'team_total_home_under_odds', None),
-                    "team_total_away": getattr(snapshot, 'team_total_away', None),
-                    "team_total_away_over_odds": getattr(snapshot, 'team_total_away_over_odds', None),
-                    "team_total_away_under_odds": getattr(snapshot, 'team_total_away_under_odds', None),
-                    "bookmaker": snapshot.bookmaker,
-                }
-                logger.info(f"Live odds: Total {odds['total_points']}, Spread {odds['spread_home']}, Team Totals {odds['team_total_home']}/{odds['team_total_away']} from {odds['bookmaker']}")
-            except OddsAPIError as e:
-                logger.warning(f"Live odds not found: {e}, trying ESPN pregame fallback...")
-                # Fallback to ESPN pregame odds
+            # ODDS RETRY LOGIC - Try up to 3 times over 3 minutes
+            # REDUCED FROM 8 to 3 to prevent blocking first game
+            max_retries = 3
+            import time
+            
+            for retry_attempt in range(max_retries):
                 try:
-                    import requests
-                    espn_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={trigger.game_id}"
-                    resp = requests.get(espn_url, timeout=10)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        # Extract pregame odds from ESPN
-                        picks = data.get("pickcenter", [])
-                        if picks:
-                            pick = picks[0]  # Use first bookmaker
-                            total_points = pick.get("overUnder")
-                            spread_home = pick.get("spread")
+                    logger.info(f"Fetching live odds for {home_name} vs {away_name}... (attempt {retry_attempt + 1}/{max_retries})")
+                    snapshot = fetch_nba_odds_snapshot(
+                        home_name=home_name,
+                        away_name=away_name,
+                        timeout_s=60,  # Give DraftKings Live more time
+                    )
+                    odds = {
+                        "total_points": snapshot.total_points,
+                        "total_over_odds": snapshot.total_over_odds,
+                        "total_under_odds": snapshot.total_under_odds,
+                        "spread_home": snapshot.spread_home,
+                        "spread_home_odds": snapshot.spread_home_odds,
+                        "spread_away_odds": snapshot.spread_away_odds,
+                        "moneyline_home": snapshot.moneyline_home,
+                        "moneyline_away": snapshot.moneyline_away,
+                        "team_total_home": getattr(snapshot, 'team_total_home', None),
+                        "team_total_home_over_odds": getattr(snapshot, 'team_total_home_over_odds', None),
+                        "team_total_home_under_odds": getattr(snapshot, 'team_total_home_under_odds', None),
+                        "team_total_away": getattr(snapshot, 'team_total_away', None),
+                        "team_total_away_over_odds": getattr(snapshot, 'team_total_away_over_odds', None),
+                        "team_total_away_under_odds": getattr(snapshot, 'team_total_away_under_odds', None),
+                        "bookmaker": snapshot.bookmaker,
+                    }
+                    logger.info(f"Live odds: Total {odds['total_points']}, Spread {odds['spread_home']}, Team Totals {odds['team_total_home']}/{odds['team_total_away']} from {odds['bookmaker']}")
+                    break  # Success! Exit retry loop
+                    
+                except OddsAPIError as e:
+                    if retry_attempt < max_retries - 1:
+                        logger.warning(f"Odds not available (attempt {retry_attempt + 1}/{max_retries}): {e}, retrying in 60 seconds...")
+                        time.sleep(60)
+                    else:
+                        # Final attempt failed, try ESPN fallback
+                        logger.warning(f"Live odds not found after {max_retries} attempts: {e}, trying ESPN pregame fallback...")
+                        try:
+                            import requests
+                            espn_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={trigger.game_id}"
+                            resp = requests.get(espn_url, timeout=10)
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                # Extract pregame odds from ESPN
+                                picks = data.get("pickcenter", [])
+                                if picks:
+                                    pick = picks[0]  # Use first bookmaker
+                                    total_points = pick.get("overUnder")
+                                    spread_home = pick.get("spread")
 
-                            # CRITICAL FIX: Validate odds data before using
-                            if total_points is None and spread_home is None:
-                                logger.warning("ESPN fallback returned no valid odds, skipping")
-                            else:
-                                odds = {
-                                    "total_points": total_points,
-                                    "total_over_odds": -110,
-                                    "total_under_odds": -110,
-                                    "spread_home": spread_home,
-                                    "spread_home_odds": -110,
-                                    "spread_away_odds": -110,
-                                    "moneyline_home": None,
-                                    "moneyline_away": None,
-                                    "bookmaker": pick.get("provider", {}).get("name", "ESPN"),
-                                }
-                                logger.info(f"ESPN fallback odds: Total {total_points or 'N/A'}, Spread {spread_home or 'N/A'}")
-                except Exception as espn_e:
-                    logger.warning(f"ESPN fallback also failed: {espn_e}")
-            except Exception as e:
-                logger.error(f"Odds fetch error: {e}")
+                                    # CRITICAL FIX: Validate odds data before using
+                                    if total_points is None and spread_home is None:
+                                        logger.warning("ESPN fallback returned no valid odds, posting without odds")
+                                    else:
+                                        odds = {
+                                            "total_points": total_points,
+                                            "total_over_odds": -110,
+                                            "total_under_odds": -110,
+                                            "spread_home": spread_home,
+                                            "spread_home_odds": -110,
+                                            "spread_away_odds": -110,
+                                            "moneyline_home": None,
+                                            "moneyline_away": None,
+                                            "bookmaker": pick.get("provider", {}).get("name", "ESPN"),
+                                        }
+                                        logger.info(f"ESPN fallback odds: Total {total_points or 'N/A'}, Spread {spread_home or 'N/A'}")
+                        except Exception as espn_e:
+                            logger.warning(f"ESPN fallback also failed: {espn_e}")
+                            
+                except Exception as e:
+                    if retry_attempt < max_retries - 1:
+                        logger.error(f"Odds fetch error (attempt {retry_attempt + 1}/{max_retries}): {e}, retrying in 60 seconds...")
+                        time.sleep(60)
+                    else:
+                        logger.error(f"Odds fetch error after {max_retries} attempts: {e}")
 
             # 4. Generate betting recommendations with team names
             home_tri = info.get("home_tricode", "HOME")
@@ -1201,9 +1504,20 @@ class PerryPicksOrchestrator:
 
                 # Save betting recommendations
                 for rec in recommendations:
+                    # Convert bet_type string to enum
+                    bet_type_str = rec["bet_type"].lower()
+                    bet_type_map = {
+                        "total": BetType.TOTAL,
+                        "spread": BetType.SPREAD,
+                        "moneyline": BetType.MONEYLINE,
+                        "ml": BetType.MONEYLINE,
+                        "team_total": BetType.TEAM_TOTAL,
+                    }
+                    bet_type_enum = bet_type_map.get(bet_type_str, BetType.TOTAL)
+
                     bet_rec = BettingRecommendation(
                         prediction_id=prediction.id,
-                        bet_type=rec["bet_type"],
+                        bet_type=bet_type_enum,
                         pick=rec["pick"],
                         line=rec.get("line"),
                         odds=rec.get("odds"),
@@ -1221,7 +1535,10 @@ class PerryPicksOrchestrator:
 
             # 6. Post to Discord and update database with result
             if self._discord_client:
-                discord_result = self._post_to_discord(info, prediction_data, odds, recommendations, efficiency_stats, passed_bets)
+                discord_result = self._post_to_discord(
+                    info, prediction_data, odds, recommendations, efficiency_stats, passed_bets,
+                    prediction_id=prediction.id, game_id=game.id
+                )
 
                 # Update database with Discord posting status
                 db = SessionLocal()
@@ -1247,6 +1564,28 @@ class PerryPicksOrchestrator:
 
         except Exception as e:
             logger.error(f"Failed to process trigger {trigger_key}: {e}")
+
+    def _is_odds_acceptable(self, odds: int) -> bool:
+        """Check if odds are acceptable (not worse than -300).
+        
+        Args:
+            odds: American odds (e.g., -110, -500, +150)
+            
+        Returns:
+            True if odds are acceptable, False if too risky
+        """
+        if odds is None:
+            return True  # No odds info, allow it
+        
+        try:
+            odds_int = int(odds)
+            # Reject if odds are worse than -300 (e.g., -500, -900)
+            if odds_int < -300:
+                logger.debug(f"Rejecting bet with odds {odds_int} (worse than -300)")
+                return False
+            return True
+        except (ValueError, TypeError):
+            return True  # If we can't parse, allow it
 
     def _generate_recommendations(self, prediction: dict, odds: Optional[dict], home_team: str = "HOME", away_team: str = "AWAY") -> tuple:
         """Generate betting recommendations based on prediction and odds.
@@ -1285,7 +1624,7 @@ class PerryPicksOrchestrator:
             pick = "OVER"
             prob = p_over
             rec_odds = odds.get("total_over_odds", -110)
-            meets_threshold = abs(diff) >= 2.0 and prob >= 0.56
+            meets_threshold = abs(diff) >= 2.0 and prob >= 0.56 and self._is_odds_acceptable(rec_odds)
 
             rec = {
                 "bet_type": "total",
@@ -1294,18 +1633,19 @@ class PerryPicksOrchestrator:
                 "odds": rec_odds,
                 "edge": diff,
                 "probability": prob,
-                "confidence_tier": "A" if prob >= 0.62 else ("B+" if prob >= 0.59 else "B"),
+                "confidence_tier": "A" if prob >= 0.75 else ("B+" if prob >= 0.65 else "B"),
             }
             if meets_threshold:
                 recommendations.append(rec)
             else:
-                passed_bets.append({**rec, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if abs(diff) >= 2.0 and prob >= 0.56 else "odds too risky (< -300)"
+                passed_bets.append({**rec, "reason": reason})
 
             # UNDER
             prob_under = 1 - p_over
             diff_under = -diff
             rec_odds_under = odds.get("total_under_odds", -110)
-            meets_threshold_under = abs(diff_under) >= 2.0 and prob_under >= 0.56
+            meets_threshold_under = abs(diff_under) >= 2.0 and prob_under >= 0.56 and self._is_odds_acceptable(rec_odds_under)
 
             rec_under = {
                 "bet_type": "total",
@@ -1314,12 +1654,13 @@ class PerryPicksOrchestrator:
                 "odds": rec_odds_under,
                 "edge": diff_under,
                 "probability": prob_under,
-                "confidence_tier": "A" if prob_under >= 0.62 else ("B+" if prob_under >= 0.59 else "B"),
+                "confidence_tier": "A" if prob_under >= 0.75 else ("B+" if prob_under >= 0.65 else "B"),
             }
             if meets_threshold_under:
                 recommendations.append(rec_under)
             else:
-                passed_bets.append({**rec_under, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if abs(diff_under) >= 2.0 and prob_under >= 0.56 else "odds too risky (< -300)"
+                passed_bets.append({**rec_under, "reason": reason})
 
         # --- SPREAD ---
         if odds.get("spread_home"):
@@ -1332,7 +1673,7 @@ class PerryPicksOrchestrator:
             prob = p_home_cover
             rec_odds = odds.get("spread_home_odds", -110)
             pick_line = f"{spread:+.1f}"
-            meets_threshold = abs(edge) >= 1.5 and prob >= 0.57
+            meets_threshold = abs(edge) >= 1.5 and prob >= 0.57 and self._is_odds_acceptable(rec_odds)
 
             rec = {
                 "bet_type": "spread",
@@ -1341,19 +1682,20 @@ class PerryPicksOrchestrator:
                 "odds": rec_odds,
                 "edge": edge,
                 "probability": prob,
-                "confidence_tier": "A" if prob >= 0.62 else ("B+" if prob >= 0.59 else "B"),
+                "confidence_tier": "A" if prob >= 0.75 else ("B+" if prob >= 0.65 else "B"),
             }
             if meets_threshold:
                 recommendations.append(rec)
             else:
-                passed_bets.append({**rec, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if abs(edge) >= 1.5 and prob >= 0.57 else "odds too risky (< -300)"
+                passed_bets.append({**rec, "reason": reason})
 
             # Away team spread
             edge_away = -edge
             prob_away = 1 - p_home_cover
             rec_odds_away = odds.get("spread_away_odds", -110)
             pick_line_away = f"{-spread:+.1f}"
-            meets_threshold_away = abs(edge_away) >= 1.5 and prob_away >= 0.57
+            meets_threshold_away = abs(edge_away) >= 1.5 and prob_away >= 0.57 and self._is_odds_acceptable(rec_odds_away)
 
             rec_away = {
                 "bet_type": "spread",
@@ -1362,12 +1704,13 @@ class PerryPicksOrchestrator:
                 "odds": rec_odds_away,
                 "edge": edge_away,
                 "probability": prob_away,
-                "confidence_tier": "A" if prob_away >= 0.62 else ("B+" if prob_away >= 0.59 else "B"),
+                "confidence_tier": "A" if prob_away >= 0.75 else ("B+" if prob_away >= 0.65 else "B"),
             }
             if meets_threshold_away:
                 recommendations.append(rec_away)
             else:
-                passed_bets.append({**rec_away, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if abs(edge_away) >= 1.5 and prob_away >= 0.57 else "odds too risky (< -300)"
+                passed_bets.append({**rec_away, "reason": reason})
 
         # --- MONEYLINE ---
         if odds.get("moneyline_home") and odds.get("moneyline_away"):
@@ -1379,35 +1722,37 @@ class PerryPicksOrchestrator:
                 away_ml_edge = (1 - home_win_prob) - away_be
 
                 # Home ML
-                meets_threshold_home = home_ml_edge >= 0.03 and home_win_prob >= 0.58
+                meets_threshold_home = home_ml_edge >= 0.03 and home_win_prob >= 0.58 and self._is_odds_acceptable(odds["moneyline_home"])
                 rec_home = {
                     "bet_type": "ml",
                     "pick": f"{home_team} ML",
                     "odds": odds["moneyline_home"],
                     "edge": home_ml_edge,
                     "probability": home_win_prob,
-                    "confidence_tier": "A" if home_win_prob >= 0.70 else ("B+" if home_win_prob >= 0.65 else "B"),
+                    "confidence_tier": "A" if home_win_prob >= 0.75 else ("B+" if home_win_prob >= 0.70 else "B"),
                 }
                 if meets_threshold_home:
                     recommendations.append(rec_home)
                 else:
-                    passed_bets.append({**rec_home, "reason": "edge/prob below threshold"})
+                    reason = "edge/prob below threshold" if home_ml_edge >= 0.03 and home_win_prob >= 0.58 else "odds too risky (< -300)"
+                    passed_bets.append({**rec_home, "reason": reason})
 
                 # Away ML
                 away_win_prob = 1 - home_win_prob
-                meets_threshold_away = away_ml_edge >= 0.03 and away_win_prob >= 0.58
+                meets_threshold_away = away_ml_edge >= 0.03 and away_win_prob >= 0.58 and self._is_odds_acceptable(odds["moneyline_away"])
                 rec_away = {
                     "bet_type": "ml",
                     "pick": f"{away_team} ML",
                     "odds": odds["moneyline_away"],
                     "edge": away_ml_edge,
                     "probability": away_win_prob,
-                    "confidence_tier": "A" if away_win_prob >= 0.70 else ("B+" if away_win_prob >= 0.65 else "B"),
+                    "confidence_tier": "A" if away_win_prob >= 0.75 else ("B+" if away_win_prob >= 0.70 else "B"),
                 }
                 if meets_threshold_away:
                     recommendations.append(rec_away)
                 else:
-                    passed_bets.append({**rec_away, "reason": "edge/prob below threshold"})
+                    reason = "edge/prob below threshold" if away_ml_edge >= 0.03 and away_win_prob >= 0.58 else "odds too risky (< -300)"
+                    passed_bets.append({**rec_away, "reason": reason})
 
             except (ValueError, TypeError) as e:
                 logger.warning(f"Could not process moneyline odds: {e}")
@@ -1419,6 +1764,40 @@ class PerryPicksOrchestrator:
         pred_away_score = (pred_total - pred_margin) / 2
         team_total_sd = total_sd * 0.7  # Team totals have lower variance than game totals
 
+        # DERIVE TEAM TOTALS IF NOT AVAILABLE FROM BOOKMAKER
+        # This allows us to generate team total recommendations even when
+        # the bookmaker doesn't provide them directly
+        if odds.get("team_total_home") is None and odds.get("team_total_away") is None and odds.get("total_points") is not None and odds.get("spread_home") is not None:
+            total = odds["total_points"]
+            spread = odds["spread_home"]
+            
+            # Sportsbook convention: spread_home is the HOME line (negative when home is favored).
+            # We want: home_total + away_total = total
+            #          home_total - away_total = -spread_home
+            # Therefore:
+            #   home_total = (total - spread_home) / 2
+            #   away_total = (total + spread_home) / 2
+            # Example: Total 230, Spread -5.5 -> Home = (230 - (-5.5)) / 2 = 117.75
+            #                           Away = (230 + (-5.5)) / 2 = 112.25
+            derived_home = (total - spread) / 2.0
+            derived_away = (total + spread) / 2.0
+
+            # Sanity: if home is favored (spread < 0) but derived_home < derived_away, swap.
+            if spread < 0 and derived_home < derived_away:
+                derived_home, derived_away = derived_away, derived_home
+            # Sanity: if home is dog (spread > 0) but derived_home > derived_away, swap.
+            if spread > 0 and derived_home > derived_away:
+                derived_home, derived_away = derived_away, derived_home
+            
+            odds["team_total_home"] = derived_home
+            odds["team_total_away"] = derived_away
+            odds["team_total_home_over_odds"] = -110  # Default to -110 for derived
+            odds["team_total_home_under_odds"] = -110
+            odds["team_total_away_over_odds"] = -110
+            odds["team_total_away_under_odds"] = -110
+            
+            logger.info(f"Derived team totals: Home {derived_home:.1f}, Away {derived_away:.1f} (from Total {total}, Spread {spread})")
+
         # Home team total
         if odds.get("team_total_home"):
             tt_line = odds["team_total_home"]
@@ -1428,7 +1807,7 @@ class PerryPicksOrchestrator:
             edge_under = tt_line - pred_home_score
 
             # Home Over
-            meets_threshold = edge_over >= 1.5 and p_over >= 0.56
+            meets_threshold = edge_over >= 1.5 and p_over >= 0.56 and self._is_odds_acceptable(odds.get("team_total_home_over_odds", -110))
             rec = {
                 "bet_type": "team_total",
                 "pick": f"{home_team} OVER {tt_line}",
@@ -1436,15 +1815,16 @@ class PerryPicksOrchestrator:
                 "odds": odds.get("team_total_home_over_odds", -110),
                 "edge": edge_over,
                 "probability": p_over,
-                "confidence_tier": "A" if p_over >= 0.62 else ("B+" if p_over >= 0.59 else "B"),
+                "confidence_tier": "A" if p_over >= 0.75 else ("B+" if p_over >= 0.65 else "B"),
             }
             if meets_threshold:
                 recommendations.append(rec)
             else:
-                passed_bets.append({**rec, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if edge_over >= 1.5 and p_over >= 0.56 else "odds too risky (< -300)"
+                passed_bets.append({**rec, "reason": reason})
 
             # Home Under
-            meets_threshold = edge_under >= 1.5 and p_under >= 0.56
+            meets_threshold = edge_under >= 1.5 and p_under >= 0.56 and self._is_odds_acceptable(odds.get("team_total_home_under_odds", -110))
             rec = {
                 "bet_type": "team_total",
                 "pick": f"{home_team} UNDER {tt_line}",
@@ -1452,12 +1832,13 @@ class PerryPicksOrchestrator:
                 "odds": odds.get("team_total_home_under_odds", -110),
                 "edge": edge_under,
                 "probability": p_under,
-                "confidence_tier": "A" if p_under >= 0.62 else ("B+" if p_under >= 0.59 else "B"),
+                "confidence_tier": "A" if p_under >= 0.75 else ("B+" if p_under >= 0.65 else "B"),
             }
             if meets_threshold:
                 recommendations.append(rec)
             else:
-                passed_bets.append({**rec, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if edge_under >= 1.5 and p_under >= 0.56 else "odds too risky (< -300)"
+                passed_bets.append({**rec, "reason": reason})
 
         # Away team total
         if odds.get("team_total_away"):
@@ -1468,7 +1849,7 @@ class PerryPicksOrchestrator:
             edge_under = tt_line - pred_away_score
 
             # Away Over
-            meets_threshold = edge_over >= 1.5 and p_over >= 0.56
+            meets_threshold = edge_over >= 1.5 and p_over >= 0.56 and self._is_odds_acceptable(odds.get("team_total_away_over_odds", -110))
             rec = {
                 "bet_type": "team_total",
                 "pick": f"{away_team} OVER {tt_line}",
@@ -1476,15 +1857,16 @@ class PerryPicksOrchestrator:
                 "odds": odds.get("team_total_away_over_odds", -110),
                 "edge": edge_over,
                 "probability": p_over,
-                "confidence_tier": "A" if p_over >= 0.62 else ("B+" if p_over >= 0.59 else "B"),
+                "confidence_tier": "A" if p_over >= 0.75 else ("B+" if p_over >= 0.65 else "B"),
             }
             if meets_threshold:
                 recommendations.append(rec)
             else:
-                passed_bets.append({**rec, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if edge_over >= 1.5 and p_over >= 0.56 else "odds too risky (< -300)"
+                passed_bets.append({**rec, "reason": reason})
 
             # Away Under
-            meets_threshold = edge_under >= 1.5 and p_under >= 0.56
+            meets_threshold = edge_under >= 1.5 and p_under >= 0.56 and self._is_odds_acceptable(odds.get("team_total_away_under_odds", -110))
             rec = {
                 "bet_type": "team_total",
                 "pick": f"{away_team} UNDER {tt_line}",
@@ -1492,12 +1874,13 @@ class PerryPicksOrchestrator:
                 "odds": odds.get("team_total_away_under_odds", -110),
                 "edge": edge_under,
                 "probability": p_under,
-                "confidence_tier": "A" if p_under >= 0.62 else ("B+" if p_under >= 0.59 else "B"),
+                "confidence_tier": "A" if p_under >= 0.75 else ("B+" if p_under >= 0.65 else "B"),
             }
             if meets_threshold:
                 recommendations.append(rec)
             else:
-                passed_bets.append({**rec, "reason": "edge/prob below threshold"})
+                reason = "edge/prob below threshold" if edge_under >= 1.5 and p_under >= 0.56 else "odds too risky (< -300)"
+                passed_bets.append({**rec, "reason": reason})
 
         # Sort recommendations by probability (descending)
         recommendations.sort(key=lambda r: r["probability"], reverse=True)
@@ -1509,7 +1892,19 @@ class PerryPicksOrchestrator:
         logger.info(f"Generated {len(recommendations)} recommendations, {len(passed_bets)} passed")
         return recommendations[:3], passed_bets  # Max 3 recommendations
 
-    def _post_to_discord(self, game_info: dict, prediction: dict, odds: Optional[dict], recommendations: List[dict], efficiency_stats: Optional[dict] = None, passed_bets: Optional[List[dict]] = None):
+    def _post_to_discord(self, game_info: dict, prediction: dict, odds: Optional[dict], recommendations: List[dict], efficiency_stats: Optional[dict] = None, passed_bets: Optional[List[dict]] = None, prediction_id: Optional[int] = None, game_id: Optional[int] = None):
+        """Post prediction to Discord with improved formatting.
+
+        Args:
+            game_info: Game information dict
+            prediction: Prediction dict
+            odds: Current odds dict
+            recommendations: List of recommended bets
+            efficiency_stats: Live efficiency stats
+            passed_bets: Bets that were evaluated but passed
+            prediction_id: Database prediction ID (for parlay tracking)
+            game_id: Database game ID (for parlay tracking)
+        """
         """Post prediction to Discord with improved formatting."""
         try:
             # Build message content
@@ -1726,6 +2121,12 @@ class PerryPicksOrchestrator:
 
                 # Check if at least one channel succeeded
                 main_result = results.get(ChannelType.MAIN)
+                sgp_result = results.get(ChannelType.SGP)
+
+                # Track parlay if SGP was posted successfully
+                if sgp_result and sgp_result.success and prediction_id and game_id:
+                    self._save_parlay_tracking(game_id, prediction_id, recs_for_take, prediction_with_teams)
+
                 if main_result and main_result.success:
                     logger.info(f"Posted to Discord channels: {list(results.keys())}")
                     return main_result
@@ -1747,6 +2148,44 @@ class PerryPicksOrchestrator:
         except Exception as e:
             logger.error(f"Discord post error: {e}")
             return None  # Return None on exception
+
+    def _save_parlay_tracking(self, game_id: int, prediction_id: int, recommendations: List[dict], prediction: dict):
+        """Save parlay to database when SGP is posted.
+
+        Args:
+            game_id: Database game ID
+            prediction_id: Database prediction ID
+            recommendations: List of recommendation dicts that could form parlay
+            prediction: Prediction dict with team info
+        """
+        try:
+            from src.automation.report_card import save_parlay_from_recommendations
+
+            home_team = prediction.get("home_team", "HOME")
+            away_team = prediction.get("away_team", "AWAY")
+
+            # Get SGP picks using the same logic as channel router
+            from src.automation.channel_router import ChannelRouter
+            router = ChannelRouter.__new__(ChannelRouter)
+            sgp_picks = router._get_sgp_picks(recommendations, home_team, away_team)
+
+            if len(sgp_picks) >= 2:
+                # Calculate combined probability
+                combined_prob = router._calculate_combined_probability(sgp_picks)
+
+                # Save to database
+                parlay_id = save_parlay_from_recommendations(
+                    game_id=game_id,
+                    prediction_id=prediction_id,
+                    recommendations=sgp_picks,
+                    combined_probability=combined_prob,
+                )
+
+                if parlay_id:
+                    logger.info(f"Saved parlay #{parlay_id} with {len(sgp_picks)} legs ({combined_prob:.0%} combined)")
+
+        except Exception as e:
+            logger.error(f"Failed to save parlay tracking: {e}")
 
     def _cleanup(self):
         """Clean up all resources."""

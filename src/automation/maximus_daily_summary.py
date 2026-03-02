@@ -1,0 +1,398 @@
+"""MAXIMUS Daily Summary Poster
+
+Posts ONE daily pregame summary to the dedicated pregame channel.
+
+Content:
+- All games today: matchup, tip time, predicted winner, total, margin
+- Best bets of the day: up to 15 (at time of posting), includes probability
+
+We do NOT route this post to the priority/parlay channels; it's a digest.
+
+Idempotency:
+- Uses a simple on-disk marker in `.cache/` keyed by league day.
+  (YAGNI for a DB schema change.)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+
+from src.utils.datetime_utils import as_utc
+from pathlib import Path
+from typing import List, Tuple
+
+from dashboard.backend.database import (
+    Game,
+    Prediction,
+    SessionLocal,
+    TriggerType,
+)
+from src.automation.discord_client import DiscordClient
+from src.utils.league_time import (
+    league_day_str,
+    format_league_dt,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class DailySummaryConfig:
+    enabled: bool
+    webhook_url: str
+    post_hour_local: int = 12  # noon America/Chicago
+    post_minute_local: int = 0
+    max_bets: int = 15
+
+
+def _marker_path(day: str) -> Path:
+    d = Path(".cache")
+    d.mkdir(exist_ok=True)
+    return d / f"maximus_daily_summary_posted_{day}.marker"
+
+
+def _format_game_block(*, game: Game, pred: Prediction) -> List[str]:
+    """Two-line summary per game (matches desired Discord layout)."""
+
+    # Game.game_date is stored as tz-naive UTC in our DB.
+    # format_league_dt assumes naive datetimes are UTC and converts for display.
+    tip_local = format_league_dt(game.game_date, fmt="%I:%M %p %Z")
+
+    away = str(game.away_team)
+    home = str(game.home_team)
+
+    margin = float(pred.pred_margin or 0.0)
+    total = float(pred.pred_total or 0.0)
+    home_win_prob = float(pred.home_win_prob or 0.5)
+
+    # Project final points
+    pred_home = (total + margin) / 2.0
+    pred_away = (total - margin) / 2.0
+
+    winner = home if margin > 0 else away
+    winp = home_win_prob if margin > 0 else (1.0 - home_win_prob)
+
+    return [
+        f"**{away} @ {home}** — {tip_local} ({(game.game_status or 'Scheduled')})",
+        f"Final: {away} {pred_away:.0f} - {home} {pred_home:.0f}",
+        f"Total: {total:.1f} | Margin: {winner} {abs(margin):.1f}",
+        f"Win Probability: {winner} {winp:.0%}",
+        "",
+    ]
+
+
+class MaximusDailySummaryPoster:
+    def __init__(self, cfg: DailySummaryConfig):
+        self._cfg = cfg
+
+    @staticmethod
+    def from_env() -> DailySummaryConfig:
+        enabled = os.environ.get("MAXIMUS_DAILY_SUMMARY_ENABLED", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        webhook = os.environ.get("DISCORD_MAXIMUS_PREGAME_WEBHOOK", "").strip()
+        hour = int(os.environ.get("MAXIMUS_DAILY_SUMMARY_POST_HOUR_LOCAL", "12"))
+        minute = int(os.environ.get("MAXIMUS_DAILY_SUMMARY_POST_MINUTE_LOCAL", "0"))
+        max_bets = int(os.environ.get("MAXIMUS_DAILY_SUMMARY_MAX_BETS", "15"))
+        return DailySummaryConfig(
+            enabled=enabled,
+            webhook_url=webhook,
+            post_hour_local=max(0, min(23, hour)),
+            post_minute_local=max(0, min(59, minute)),
+            max_bets=max(1, max_bets),
+        )
+
+    def should_post_now(self, *, force: bool = False) -> bool:
+        if force:
+            return True
+        if not self._cfg.enabled:
+            return False
+        if not self._cfg.webhook_url:
+            return False
+
+        day = league_day_str()
+        if _marker_path(day).exists():
+            return False
+
+        # Post at/after local time (America/Chicago)
+        from src.utils.league_time import league_now
+
+        now_local = league_now()
+        if now_local.hour > self._cfg.post_hour_local:
+            return True
+        if now_local.hour < self._cfg.post_hour_local:
+            return False
+        return now_local.minute >= self._cfg.post_minute_local
+
+    def post_daily_summary(self, *, force: bool = False) -> bool:
+        if not self.should_post_now(force=force):
+            return False
+
+        # Ensure we have pregame predictions generated for today (idempotent)
+        try:
+            from src.automation.pregame_cycle import PregameCycleConfig, run_pregame_cycle
+
+            run_pregame_cycle(cfg=PregameCycleConfig(lookahead_hours=36.0, min_minutes_before_tip=15.0))
+        except Exception as e:
+            logger.warning(f"MAXIMUS daily summary: pregame cycle warmup failed: {e}")
+
+        day = league_day_str()
+        db = SessionLocal()
+        try:
+            # Pregame predictions for today's league day.
+            # DB stores Game.game_date as tz-naive UTC, so we must convert league-day local
+            # boundaries to UTC and compare in UTC.
+            day = league_day_str()
+
+            from zoneinfo import ZoneInfo
+            from src.utils.league_time import LEAGUE_TZ_NAME
+
+            start_local = datetime.fromisoformat(day).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=ZoneInfo(LEAGUE_TZ_NAME))
+            end_local = start_local.replace(hour=23, minute=59, second=59, microsecond=999999)
+            start_utc = start_local.astimezone(ZoneInfo('UTC')).replace(tzinfo=None)
+            end_utc = end_local.astimezone(ZoneInfo('UTC')).replace(tzinfo=None)
+
+            rows: List[Tuple[Prediction, Game]] = (
+                db.query(Prediction, Game)
+                .join(Game)
+                .filter(
+                    Prediction.trigger_type == TriggerType.PREGAME,
+                    Game.game_date >= start_utc,
+                    Game.game_date <= end_utc,
+                )
+                .order_by(Game.game_date.asc())
+                .all()
+            )
+
+            if not rows:
+                logger.info("MAXIMUS daily summary: no pregame predictions found")
+                return False
+
+            header: List[str] = [
+                "🧠 **MAXIMUS — DAILY PREGAME SUMMARY**",
+                f"Date: **{day}**",
+                "",
+                "MAXIMUS MODEL PROJECTION",
+                "",
+            ]
+
+            games_lines: List[str] = ["---", "", "**Today’s Games**", ""]
+            for pred, game in rows:
+                games_lines.extend(_format_game_block(game=game, pred=pred))
+
+            # Best bets of the day (up to N), recomputed with CURRENT odds at posting time.
+            # This matches your spec: "whatever is suggested at time of posting".
+            from src.automation.post_generator import PostGenerator
+            from src.odds import OddsAPIError, fetch_nba_odds_snapshot
+
+            post_gen = PostGenerator(include_betting=True)
+            all_recs = []  # list of (probability, line)
+
+            for pred, game in rows:
+                # Skip already-started/final games for BEST BETS recomputation.
+                # ESPN stops publishing odds once games are in-progress/final.
+                status = (game.game_status or "").lower()
+                # Authoritative gating: only include Scheduled games.
+                # Time math is fragile because DB stores naive league-local.
+                if "scheduled" not in status:
+                    continue
+
+                home = str(game.home_team)
+                away = str(game.away_team)
+
+                odds = None
+                try:
+                    snap = fetch_nba_odds_snapshot(home_name=home, away_name=away, timeout_s=10)
+                    odds = {
+                        "total_points": snap.total_points,
+                        "total_over_odds": snap.total_over_odds,
+                        "total_under_odds": snap.total_under_odds,
+                        "spread_home": snap.spread_home,
+                        "spread_home_odds": snap.spread_home_odds,
+                        "spread_away_odds": snap.spread_away_odds,
+                        "moneyline_home": snap.moneyline_home,
+                        "moneyline_away": snap.moneyline_away,
+                        "team_total_home": snap.team_total_home,
+                        "team_total_home_over_odds": snap.team_total_home_over_odds,
+                        "team_total_home_under_odds": snap.team_total_home_under_odds,
+                        "team_total_away": snap.team_total_away,
+                        "team_total_away_over_odds": snap.team_total_away_over_odds,
+                        "team_total_away_under_odds": snap.team_total_away_under_odds,
+                        "bookmaker": snap.bookmaker,
+                    }
+                except OddsAPIError:
+                    odds = None
+
+                from src.betting import normal_from_q10q90
+
+                _mu_t, sd_t = normal_from_q10q90(
+                    float(pred.total_q10 or 0.0),
+                    float(pred.total_q90 or 0.0),
+                    default_sd=10.87,
+                )
+                _mu_m, sd_m = normal_from_q10q90(
+                    float(pred.margin_q10 or 0.0),
+                    float(pred.margin_q90 or 0.0),
+                    default_sd=7.76,
+                )
+
+                pred_dict = {
+                    "pred_final_total": float(pred.pred_total or 0.0),
+                    "pred_final_margin": float(pred.pred_margin or 0.0),
+                    "home_win_prob": float(pred.home_win_prob or 0.5),
+                    "total_sd": float(sd_t),
+                    "margin_sd": float(sd_m),
+                }
+
+                from src.automation.maximus_safety import (
+                    safety_config_from_env,
+                    prediction_is_sane,
+                )
+
+                safety_cfg = safety_config_from_env()
+                if not prediction_is_sane(
+                    pred_total=pred_dict["pred_final_total"],
+                    pred_margin=pred_dict["pred_final_margin"],
+                    cfg=safety_cfg,
+                ):
+                    continue
+
+                recs, _passed = post_gen.create_recommendations_from_prediction(
+                    pred_dict,
+                    odds,
+                    home_team=home,
+                    away_team=away,
+                )
+
+                from src.betting import fmt_pct
+
+                for r in recs:
+                    odds_s = f" ({int(r.odds)})" if r.odds is not None else ""
+                    pick_txt = post_gen._format_bet_side(r, home, away, short=False)
+                    line = f"• {away}@{home}: {pick_txt}" + odds_s + f" — Prob {fmt_pct(r.probability, digits=1)}"
+                    all_recs.append((float(r.probability), line))
+
+            all_recs.sort(key=lambda x: x[0], reverse=True)
+            best_lines = [ln for _p, ln in all_recs[: self._cfg.max_bets]]
+
+            # Fallback: if we can't recompute (games started/final, or ESPN stopped publishing odds),
+            # use the *stored* betting recommendations created during the MAXIMUS pregame cycle.
+            if not best_lines:
+                try:
+                    from dashboard.backend.database import BettingRecommendation, BetType
+
+                    stored_rows = (
+                        db.query(BettingRecommendation, Prediction, Game)
+                        .join(Prediction, BettingRecommendation.prediction_id == Prediction.id)
+                        .join(Game, Prediction.game_id == Game.id)
+                        .filter(
+                            Prediction.trigger_type == TriggerType.PREGAME,
+                            Game.game_date >= start_utc,
+                            Game.game_date < end_utc,
+                        )
+                        .filter(
+                            ~Game.game_status.ilike("%final%"),
+                            ~Game.game_status.ilike("%in progress%"),
+                            ~Game.game_status.ilike("%halftime%"),
+                            ~Game.game_status.ilike("%end of%"),
+                        )
+                        .all()
+                    )
+
+                    def _fmt_stored(rec: BettingRecommendation, game: Game) -> str:
+                        home = str(game.home_team)
+                        away = str(game.away_team)
+                        bt = rec.bet_type
+                        odds_s = f" ({int(rec.odds)})" if rec.odds is not None else ""
+                        p = fmt_pct(float(rec.probability or 0.0), digits=1)
+
+                        if bt == BetType.TOTAL:
+                            pick_txt = f"{str(rec.pick).upper()} {float(rec.line):.1f}" if rec.line is not None else str(rec.pick)
+                            return f"• {away}@{home}: {pick_txt}" + odds_s + f" — Prob {p}"
+
+                        if bt == BetType.SPREAD:
+                            if (rec.pick or "").upper() == "HOME":
+                                pick_txt = f"{home} {float(rec.line):+.1f}" if rec.line is not None else f"{home}"
+                            elif (rec.pick or "").upper() == "AWAY":
+                                pick_txt = f"{away} {float(rec.line):+.1f}" if rec.line is not None else f"{away}"
+                            else:
+                                pick_txt = str(rec.pick)
+                            return f"• {away}@{home}: {pick_txt}" + odds_s + f" — Prob {p}"
+
+                        if bt == BetType.MONEYLINE:
+                            team = home if (rec.pick or "").upper() == "HOME" else away
+                            pick_txt = f"{team} ML"
+                            return f"• {away}@{home}: {pick_txt}" + odds_s + f" — Prob {p}"
+
+                        if bt == BetType.TEAM_TOTAL:
+                            # For MAXIMUS, we embed team in `pick` when available (e.g. "UTA OVER 112.5").
+                            pick_txt = str(rec.pick)
+                            if rec.line is not None and str(rec.line) not in pick_txt:
+                                pick_txt = f"{pick_txt} {float(rec.line):.1f}".strip()
+                            return f"• {away}@{home}: {pick_txt}" + odds_s + f" — Prob {p}"
+
+                        return f"• {away}@{home}: {rec.pick}" + odds_s + f" — Prob {p}"
+
+                    stored_lines = []
+                    for rec, pred2, game2 in stored_rows:
+                        stored_lines.append((float(rec.probability or 0.0), _fmt_stored(rec, game2)))
+
+                    stored_lines.sort(key=lambda x: x[0], reverse=True)
+                    best_lines = [ln for _p, ln in stored_lines[: self._cfg.max_bets]]
+                except Exception as e:
+                    logger.warning(f"MAXIMUS daily summary: stored-bets fallback failed: {e}")
+
+            bets_lines: List[str] = [
+                "",
+                "---",
+                "",
+                f"**Best Bets of the Day (Top {len(best_lines)} / {self._cfg.max_bets})**",
+            ]
+            bets_lines.extend(best_lines)
+            bets_lines.extend(["", "_PerryPicks MAXIMUS_"])
+
+            # SINGLE POST: fit-to-Discord limit (2000 chars).
+            # If we run long (big slate), we degrade the per-game block to a single line.
+
+            def one_line_game(*, game: Game, pred: Prediction) -> str:
+                from src.utils.datetime_utils import as_utc_from_league_local
+
+                tip_local = format_league_dt(as_utc_from_league_local(game.game_date), fmt="%I:%M %p %Z")
+                away = str(game.away_team)
+                home = str(game.home_team)
+                margin = float(pred.pred_margin or 0.0)
+                total = float(pred.pred_total or 0.0)
+                home_win_prob = float(pred.home_win_prob or 0.5)
+                winner = home if margin > 0 else away
+                winp = home_win_prob if margin > 0 else (1.0 - home_win_prob)
+                return f"• {away}@{home} {tip_local} | {winner} {abs(margin):.1f} | T {total:.1f} | {winner} {winp:.0%}"
+
+            content_parts = header + games_lines + bets_lines
+            content = "\n".join(content_parts)
+
+            if len(content) > 1950:
+                # rebuild games_lines compactly
+                compact_games = ["---", "", "**Today’s Games**", ""]
+                for pred, game in rows:
+                    compact_games.append(one_line_game(game=game, pred=pred))
+                content_parts = header + compact_games + bets_lines
+                content = "\n".join(content_parts)
+
+            # Final hard cap
+            content = content[:1990]
+
+            client = DiscordClient(self._cfg.webhook_url, username="MAXIMUS")
+            res = client.post_message(content)
+            if not res.success:
+                raise RuntimeError(res.error or "discord post failed")
+
+            _marker_path(day).write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+            logger.info("MAXIMUS daily summary posted")
+            return True
+        finally:
+            db.close()

@@ -1,0 +1,101 @@
+"""Run MAXIMUS pregame cycle + Discord poster as a small sidecar service.
+
+Why this exists:
+- `start.py` is already massive (2300+ lines). Adding more responsibilities violates SRP.
+- MAXIMUS pregame is logically independent of REPTAR halftime/Q3 automation.
+
+Usage:
+  .venv/bin/python run_maximus_pregame.py
+
+Env:
+  MAXIMUS_PREGAME_ENABLED=true|false               (controls prediction creation)
+  MAXIMUS_PREGAME_POSTING_ENABLED=true|false       (controls Discord posting)
+  DISCORD_MAXIMUS_PREGAME_WEBHOOK=https://...      (required if posting enabled)
+  MAXIMUS_PREGAME_TICK_SECONDS=60                  (loop interval)
+
+This service is idempotent:
+- prediction creation skips if PREGAME prediction already exists for a game.
+- posting only posts rows where posted_to_discord=False.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime, timezone
+
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
+
+
+logger = logging.getLogger("maximus-runner")
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def main() -> None:
+    tick_seconds = int(os.environ.get("MAXIMUS_PREGAME_TICK_SECONDS", "60"))
+    tick_seconds = max(15, tick_seconds)
+
+    pregame_enabled = _bool_env("MAXIMUS_PREGAME_ENABLED", True)
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    logger.info("MAXIMUS sidecar starting")
+    logger.info("tick_seconds=%s", tick_seconds)
+    logger.info("pregame_enabled=%s", pregame_enabled)
+
+    # Lazy imports after env load (avoid import-time side effects)
+    from src.automation.pregame_cycle import PregameCycleConfig, run_pregame_cycle
+    from src.automation.maximus_pregame_poster import MaximusPregamePoster
+    from src.automation.maximus_daily_summary import MaximusDailySummaryPoster
+
+    daily_cfg = MaximusDailySummaryPoster.from_env()
+    daily = MaximusDailySummaryPoster(daily_cfg)
+
+    poster_cfg = MaximusPregamePoster.from_env()
+    poster = MaximusPregamePoster(poster_cfg)
+    if poster_cfg.enabled and not poster_cfg.webhook_url:
+        logger.error("Posting enabled but DISCORD_MAXIMUS_PREGAME_WEBHOOK missing (won't post)")
+
+    while True:
+        start = time.time()
+        try:
+            created = 0
+            if pregame_enabled:
+                created = run_pregame_cycle(cfg=PregameCycleConfig())
+
+            posted = poster.post_pending()
+            # Only attempt daily summary when the time gate says yes (avoids needless DB/odds work).
+            if daily.should_post_now(force=False):
+                summary_posted = daily.post_daily_summary(force=False)
+                if summary_posted:
+                    logger.info("daily summary posted")
+
+            logger.info(
+                "tick ok | created=%s posted=%s elapsed=%.2fs at=%s",
+                created,
+                posted,
+                time.time() - start,
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            )
+        except Exception as e:
+            # Keep the process alive. Let watchdog alert on crash if needed.
+            logger.exception("tick failed: %s", e)
+
+        time.sleep(tick_seconds)
+
+
+if __name__ == "__main__":
+    main()

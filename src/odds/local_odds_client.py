@@ -26,8 +26,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Default to localhost port 8890 (Odds_Api runs here, PerryPicks backend on 8000)
-ODDS_API_BASE_URL = os.getenv("ODDS_API_BASE_URL", "http://localhost:8890")
+def _odds_api_base_url() -> str:
+    # Default to localhost port 8890 (Odds_Api runs here, PerryPicks backend on 8000)
+    return os.getenv("ODDS_API_BASE_URL", "http://localhost:8890")
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -108,7 +109,7 @@ def fetch_nba_odds_snapshot(
     Raises:
         OddsAPIError: If the API call fails or no match found
     """
-    url = f"{ODDS_API_BASE_URL}/v1/snapshot"
+    url = f"{_odds_api_base_url()}/v1/snapshot"
     params = {
         "home_name": home_name,
         "away_name": away_name,
@@ -197,7 +198,7 @@ def fetch_all_nba_odds(timeout_s: int = 10) -> Dict[str, Any]:
     Returns:
         Dict with 'events' list containing all games with odds
     """
-    url = f"{ODDS_API_BASE_URL}/v1/odds"
+    url = f"{_odds_api_base_url()}/v1/odds"
     params = {"sport": "nba"}
 
     try:
@@ -210,7 +211,7 @@ def fetch_all_nba_odds(timeout_s: int = 10) -> Dict[str, Any]:
 
 def health_check(timeout_s: int = 5) -> bool:
     """Check if the local odds API is healthy."""
-    url = f"{ODDS_API_BASE_URL}/v1/health"
+    url = f"{_odds_api_base_url()}/v1/health"
 
     try:
         response = requests.get(url, timeout=timeout_s)

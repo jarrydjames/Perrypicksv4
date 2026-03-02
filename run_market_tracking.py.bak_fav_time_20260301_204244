@@ -1,0 +1,533 @@
+"""Prototype sidecar: market-implied tracking for halftime bets.
+
+Option 2: posts standalone tracker messages to DISCORD_LIVE_TRACKING_WEBHOOK.
+Option A: edits the same message continuously.
+
+HARD RULE:
+- Uses local composite odds only.
+- Does NOT use model probabilities.
+
+This is prototype-grade: fixed sigmas, basic trend.
+
+Start manually:
+  .venv/bin/python run_market_tracking.py
+
+Stop:
+  kill <pid>
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+from dotenv import load_dotenv
+from sqlalchemy.exc import OperationalError
+
+# Ensure we import from THIS repo (v5), not a sibling checkout (v4).
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from dashboard.backend.database import (
+    BettingRecommendation,
+    BetStatus,
+    Game,
+    Prediction,
+    SessionLocal,
+    TriggerType,
+    MarketTrackingMessage,
+    MarketTrackingPoint,
+)
+
+from src.market_likelihood.market_data import LocalOddsQuery, fetch_local_snapshot
+from src.market_likelihood.market_implied import (
+    SigmaConfig,
+    estimate_spread_from_snapshot,
+    estimate_total_from_snapshot,
+)
+from src.market_likelihood.state import StateTracker, TierPolicy, tier_for_p
+from src.market_likelihood.types import ProbabilityEstimate
+from src.market_likelihood.tracker_view import build_tracking_embed, build_final_embed
+from src.automation.bet_resolver import resolve_spread_bet, resolve_total_bet
+from src.market_likelihood.discord_adapter import DiscordAdapterConfig, MarketDiscordPublisher
+
+logger = logging.getLogger("market-tracking")
+
+
+@dataclass(frozen=True)
+class RunnerConfig:
+    poll_seconds: int = 30
+    edit_seconds: int = 60
+    lookback_hours: int = 6
+
+    # Only track bets whose recommendation probability >= threshold
+    min_rec_prob: float = 0.72
+
+    # Track only these bet types
+    track_spread: bool = True
+    track_total: bool = True
+
+OLD_CACHE_PATH = Path(".cache/market_tracking_message_ids.json")
+
+
+def _bootstrap_tracking_messages_from_cache(db) -> None:
+    """Best-effort migration from old JSON cache into DB.
+
+    This prevents duplicate tracker posts after upgrading to DB-backed idempotency.
+    Safe to run repeatedly.
+    """
+
+    if not OLD_CACHE_PATH.exists():
+        return
+
+    try:
+        raw = json.loads(OLD_CACHE_PATH.read_text())
+    except Exception:
+        logger.info("failed to read old market tracking cache; skipping bootstrap")
+        return
+
+    if not isinstance(raw, dict):
+        return
+
+    created = 0
+    for k, v in raw.items():
+        try:
+            rec_id = int(k)
+        except Exception:
+            continue
+
+        if isinstance(v, str):
+            message_id = v
+            status = "active"
+        elif isinstance(v, dict):
+            message_id = v.get("message_id")
+            status = "finalized" if bool(v.get("finalized", False)) else "active"
+        else:
+            continue
+
+        if not isinstance(message_id, str) or not message_id.strip():
+            continue
+
+        exists = (
+            db.query(MarketTrackingMessage)
+            .filter(MarketTrackingMessage.recommendation_id == rec_id)
+            .first()
+        )
+        if exists:
+            continue
+
+        db.add(
+            MarketTrackingMessage(
+                recommendation_id=rec_id,
+                discord_message_id=message_id.strip(),
+                status=status,
+            )
+        )
+        created += 1
+
+    if created:
+        _db_commit_with_retry(db)
+        logger.info("bootstrapped %s market tracking messages from old cache", created)
+
+
+def _db_commit_with_retry(db, *, attempts: int = 5) -> None:
+    """Commit with retries for SQLite lock contention.
+
+    Multiple processes write to the same SQLite file (automation, tracker, etc.).
+    WAL + busy_timeout help, but we still retry to avoid dropping updates.
+    """
+
+    delay_s = 0.2
+    for i in range(attempts):
+        try:
+            db.commit()
+            return
+        except OperationalError as e:
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                time.sleep(delay_s)
+                delay_s = min(2.0, delay_s * 2)
+                continue
+            raise
+
+    # Last attempt: raise the last error
+    db.commit()
+
+
+
+def _parse_team_from_pick(pick: str) -> Optional[str]:
+    if not pick:
+        return None
+    # Spread pick formats: "BKN +4.5" or "ORL -2.5"
+    # Total pick formats: "OVER 248.5" (no team)
+    return pick.strip().split()[0].upper()
+
+
+def _is_total_pick(pick: str) -> bool:
+    if not pick:
+        return False
+    return pick.strip().upper().startswith("OVER") or pick.strip().upper().startswith("UNDER")
+
+
+def _total_side(pick: str) -> str:
+    return pick.strip().split()[0].upper()
+
+
+def _ticket_label_for_rec(game: Game, rec: BettingRecommendation) -> str:
+    bt = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+    if bt == "SPREAD":
+        team = _parse_team_from_pick(rec.pick) or "?"
+        return f"{team} {float(rec.line):+0.1f}"
+    if bt == "TOTAL":
+        side = _total_side(rec.pick)
+        return f"{side} {float(rec.line):.1f}"
+    return rec.pick
+
+
+def _live_label_from_snapshot(game: Game, rec: BettingRecommendation, snap) -> str:
+    bt = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+    if bt == "SPREAD":
+        # Show both sides of current market
+        if snap.spread_home is None:
+            return "Spread market unavailable"
+        home_line = float(snap.spread_home)
+        away_line = -home_line
+        return f"{game.home_team} {home_line:+.1f} ({snap.spread_home_odds:+d}) / {game.away_team} {away_line:+.1f} ({snap.spread_away_odds:+d})"
+    if bt == "TOTAL":
+        if snap.total_points is None:
+            return "Total market unavailable"
+        meta = ""
+        if getattr(snap, "bookmaker", None):
+            meta = str(snap.bookmaker)
+        if getattr(snap, "last_update", None):
+            meta = (meta + " " if meta else "") + str(snap.last_update)[11:19]  # HH:MM:SS
+        meta = f" | {meta}" if meta else ""
+        return f"O/U {float(snap.total_points):.1f} ({snap.total_over_odds:+d}/{snap.total_under_odds:+d}){meta}"
+    return ""
+
+
+def _move_vs_ticket_pts(game: Game, rec: BettingRecommendation, snap) -> Optional[float]:
+    bt = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+    if bt == "SPREAD" and snap.spread_home is not None and rec.line is not None:
+        team = _parse_team_from_pick(rec.pick)
+        if not team:
+            return None
+        if team.upper() == game.home_team.upper():
+            # more positive = moved against a negative favorite line
+            return float(snap.spread_home) - float(rec.line)
+        if team.upper() == game.away_team.upper():
+            # away ticket line is stored signed for away team; current away line is -spread_home
+            return float(-snap.spread_home) - float(rec.line)
+    if bt == "TOTAL" and snap.total_points is not None and rec.line is not None:
+        return float(snap.total_points) - float(rec.line)
+    return None
+
+def _move_detail(game: Game, rec: BettingRecommendation, snap) -> Optional[str]:
+    """Human-friendly move label showing ticket -> live line."""
+    bt = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+
+    if bt == "TOTAL" and snap.total_points is not None and rec.line is not None:
+        live = float(snap.total_points)
+        ticket = float(rec.line)
+        delta = live - ticket
+        return f"Move {delta:+.1f} ({ticket:.1f}→{live:.1f})"
+
+    if bt == "SPREAD" and snap.spread_home is not None and rec.line is not None:
+        team = _parse_team_from_pick(rec.pick)
+        if not team:
+            return None
+        ticket = float(rec.line)
+        if team.upper() == game.home_team.upper():
+            live = float(snap.spread_home)
+        elif team.upper() == game.away_team.upper():
+            live = float(-snap.spread_home)
+        else:
+            return None
+        delta = live - ticket
+        return f"Move {delta:+.1f} ({ticket:+.1f}→{live:+.1f})"
+
+    return None
+
+
+
+def _compute_p_hit(game: Game, rec: BettingRecommendation, snap, sigma: SigmaConfig) -> Tuple[Optional[float], Tuple[str, ...]]:
+    bt = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+
+    if bt == "SPREAD":
+        team = _parse_team_from_pick(rec.pick)
+        if not team:
+            return None, ("could not parse team from pick",)
+        if snap.spread_home is None or snap.spread_home_odds is None or snap.spread_away_odds is None:
+            return None, ("spread market missing",)
+        res = estimate_spread_from_snapshot(
+            home_team=game.home_team,
+            away_team=game.away_team,
+            ticket_team=team,
+            ticket_line=float(rec.line),
+            spread_home=float(snap.spread_home),
+            spread_home_odds=int(snap.spread_home_odds),
+            spread_away_odds=int(snap.spread_away_odds),
+            sigma_cfg=sigma,
+        )
+        return res.p_hit, res.notes
+
+    if bt == "TOTAL":
+        if not _is_total_pick(rec.pick):
+            return None, ("could not parse total side",)
+        if snap.total_points is None or snap.total_over_odds is None or snap.total_under_odds is None:
+            return None, ("total market missing",)
+        res = estimate_total_from_snapshot(
+            ticket_side=_total_side(rec.pick),
+            ticket_line=float(rec.line),
+            total_points=float(snap.total_points),
+            total_over_odds=int(snap.total_over_odds),
+            total_under_odds=int(snap.total_under_odds),
+            sigma_cfg=sigma,
+        )
+        return res.p_hit, res.notes
+
+    return None, ("unsupported bet type",)
+
+
+def main() -> None:
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    cfg = RunnerConfig(
+        poll_seconds=int(os.environ.get("MARKET_TRACK_POLL_SECONDS", "30")),
+        edit_seconds=int(os.environ.get("MARKET_TRACK_EDIT_SECONDS", "60")),
+        lookback_hours=int(os.environ.get("MARKET_TRACK_LOOKBACK_HOURS", "6")),
+        min_rec_prob=float(os.environ.get("MARKET_TRACK_MIN_REC_PROB", "0.72")),
+    )
+
+    discord_cfg = DiscordAdapterConfig.from_env()
+    if not discord_cfg.webhook_url:
+        raise SystemExit("Missing DISCORD_LIVE_TRACKING_WEBHOOK (or DISCORD_WEBHOOK_URL fallback)")
+
+    publisher = MarketDiscordPublisher(discord_cfg)
+
+    policy = TierPolicy()
+    tracker = StateTracker(policy=policy)
+    sigma = SigmaConfig()
+
+    bootstrapped = False
+
+    logger.info("market tracking sidecar started")
+    logger.info("poll_seconds=%s edit_seconds=%s", cfg.poll_seconds, cfg.edit_seconds)
+
+    while True:
+        start = time.time()
+        now = datetime.now(timezone.utc)
+        db = SessionLocal()
+        try:
+            if not bootstrapped:
+                _bootstrap_tracking_messages_from_cache(db)
+                bootstrapped = True
+            cutoff = now - timedelta(hours=cfg.lookback_hours)
+
+            preds = (
+                db.query(Prediction, Game)
+                .join(Game)
+                .filter(
+                    Prediction.trigger_type == TriggerType.HALFTIME,
+                    Prediction.posted_to_discord == True,  # noqa: E712
+                    Prediction.created_at >= cutoff.replace(tzinfo=None),
+                )
+                .order_by(Prediction.created_at.desc())
+                .limit(25)
+                .all()
+            )
+
+            for pred, game in preds:
+                # Track only games that have started. If Final, do one last finalize edit.
+                status = (game.game_status or "").strip().lower()
+                if status == "scheduled":
+                    continue
+                if (game.period or 0) <= 0:
+                    continue
+                recs = (
+                    db.query(BettingRecommendation)
+                    .filter(BettingRecommendation.prediction_id == pred.id)
+                    .all()
+                )
+
+                for rec in recs:
+                    # Only track high-confidence recommendations (filter only; tracking math remains market-only).
+                    try:
+                        rec_prob = float(rec.probability) if rec.probability is not None else 0.0
+                    except Exception:
+                        rec_prob = 0.0
+                    if rec_prob < cfg.min_rec_prob:
+                        continue
+                    bt = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+                    if bt == "MONEYLINE" or bt == "TEAM_TOTAL":
+                        continue
+                    if bt not in ("SPREAD", "TOTAL"):
+                        continue
+
+                    rec_key = str(rec.id)
+
+                    # If game ended, finalize tracker message once (verdict + stop).
+                    if status == "final":
+                        entry = db.query(MarketTrackingMessage).filter(MarketTrackingMessage.recommendation_id == rec.id).first()
+                        if not entry:
+                            continue
+                        if (entry.status or "").lower() == "finalized":
+                            continue
+
+                        final_home = float(game.final_home_score or 0)
+                        final_away = float(game.final_away_score or 0)
+                        matchup = f"{game.away_team} @ {game.home_team}"
+                        final_score = f"{int(final_away)} - {int(final_home)}"
+                        ticket_label = _ticket_label_for_rec(game, rec)
+                        bt2 = str(getattr(rec.bet_type, "value", rec.bet_type)).upper()
+                        if bt2 == "SPREAD":
+                            result = resolve_spread_bet(final_home, final_away, float(rec.line or 0.0), rec.pick or "", game.home_team, game.away_team)
+                        else:
+                            result = resolve_total_bet(final_home + final_away, float(rec.line or 0.0), rec.pick or "")
+
+                        # Write back official outcome into DB for dashboard consistency
+                        res_norm = (result or "").lower().strip()
+                        if res_norm == "won":
+                            rec.result = BetStatus.WON
+                        elif res_norm == "push":
+                            rec.result = BetStatus.PUSH
+                        else:
+                            rec.result = BetStatus.LOST
+                        db.add(rec)
+                        _db_commit_with_retry(db)
+
+                        embed_final = build_final_embed(
+                            matchup=matchup,
+                            ticket_label=ticket_label,
+                            final_score=final_score,
+                            result=result,
+                        )
+                        publisher.edit_tracker(message_id=str(entry.discord_message_id), content="", embed=embed_final)
+                        entry.status = "finalized"
+                        db.add(entry)
+                        _db_commit_with_retry(db)
+                        continue
+
+                    # Fetch market snapshot (local-only)
+                    try:
+                        snap = fetch_local_snapshot(LocalOddsQuery(home=game.home_team, away=game.away_team, timeout_s=10))
+                    except Exception as e:
+                        logger.info("local odds unavailable for %s@%s: %s", game.away_team, game.home_team, e)
+                        continue
+
+                    p_hit, notes = _compute_p_hit(game, rec, snap, sigma)
+                    if p_hit is None:
+                        continue
+
+                    move_pts = _move_vs_ticket_pts(game, rec, snap)
+
+                    est = ProbabilityEstimate(
+                        bet_id=rec_key,
+                        timestamp_utc=now,
+                        p_hit=float(p_hit),
+                        move_points_against_ticket=move_pts,
+                        notes=notes,
+                    )
+                    st = tracker.upsert(est)
+
+                    # Trend (restart-safe): compare against point at/before ~2 minutes ago
+                    now_naive = now.replace(tzinfo=None)
+                    target = now_naive - timedelta(seconds=120)
+                    prev_pt = (
+                        db.query(MarketTrackingPoint)
+                        .filter(
+                            MarketTrackingPoint.recommendation_id == rec.id,
+                            MarketTrackingPoint.timestamp_utc <= target,
+                        )
+                        .order_by(MarketTrackingPoint.timestamp_utc.desc())
+                        .first()
+                    )
+                    delta_2m = (est.p_hit - float(prev_pt.p_hit)) if prev_pt is not None else None
+
+                    tier = st.current_tier or tier_for_p(est.p_hit, policy)
+
+                    ticket_label = _ticket_label_for_rec(game, rec)
+                    live_label = _live_label_from_snapshot(game, rec, snap)
+                    matchup = f"{game.away_team} @ {game.home_team}"
+
+                    embed = build_tracking_embed(
+                        matchup=matchup,
+                        ticket_label=ticket_label,
+                        live_label=live_label,
+                        p_hit=p_hit,
+                        tier=tier,
+                        delta_2m=delta_2m,
+                        move_pts=move_pts,
+                        move_detail=_move_detail(game, rec, snap),
+                        notes=notes,
+                    )
+
+                    # Create tracker message once (DB-backed idempotency)
+                    entry = db.query(MarketTrackingMessage).filter(MarketTrackingMessage.recommendation_id == rec.id).first()
+                    if not entry:
+                        mid = publisher.post_tracker(content="", embed=embed)
+                        if mid:
+                            entry = MarketTrackingMessage(
+                                recommendation_id=rec.id,
+                                discord_message_id=str(mid),
+                                status="active",
+                            )
+                            db.add(entry)
+                            _db_commit_with_retry(db)
+                        continue
+
+                    # Edit tracker message at edit cadence (persisted in DB for restart-safety)
+                    now_naive = now.replace(tzinfo=None)
+                    last = entry.last_edited_at
+                    should_edit = last is None or (now_naive - last).total_seconds() >= cfg.edit_seconds
+                    if should_edit:
+                        publisher.edit_tracker(message_id=str(entry.discord_message_id), content="", embed=embed)
+
+                        entry.last_edited_at = now_naive
+                        db.add(entry)
+
+                        # Store point for trend (restart-safe)
+                        db.add(
+                            MarketTrackingPoint(
+                                recommendation_id=rec.id,
+                                timestamp_utc=now_naive,
+                                p_hit=float(p_hit),
+                            )
+                        )
+
+                        # Keep DB small: prune old points (per rec)
+                        prune_before = now_naive - timedelta(hours=4)
+                        (
+                            db.query(MarketTrackingPoint)
+                            .filter(
+                                MarketTrackingPoint.recommendation_id == rec.id,
+                                MarketTrackingPoint.timestamp_utc < prune_before,
+                            )
+                            .delete(synchronize_session=False)
+                        )
+
+                        _db_commit_with_retry(db)
+
+        finally:
+            db.close()
+
+        elapsed = time.time() - start
+        sleep_for = max(1.0, cfg.poll_seconds - elapsed)
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    main()

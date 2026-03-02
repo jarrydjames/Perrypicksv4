@@ -51,7 +51,7 @@ _session.mount("http://", _adapter)
 # Cache settings
 CACHE_DIR = Path(".cache/nba_cdn")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_TTL_SECONDS = 30  # 30 seconds - CRITICAL FIX: Reduced from 5 min for live games
+CACHE_TTL_SECONDS = 60  # 60 seconds - Rate limit protection: Increased to reduce NBA CDN requests
 
 # Headers to avoid blocking (updated per NBA CDN best practices)
 NBA_HEADERS = {

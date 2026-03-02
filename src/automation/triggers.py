@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class TriggerType(str, Enum):
     """Types of triggers that can fire predictions."""
 
+    PREGAME = "pregame"
     HALFTIME = "halftime"
     Q3_5MIN = "q3_5min"
 
@@ -98,10 +99,25 @@ class TriggerEngine:
         self._fired_triggers.add(key)
 
     def check_halftime_trigger(self, state: GameState) -> bool:
-        """Check if halftime trigger should fire."""
+        """Check if halftime trigger should fire.
+        
+        Includes catch-up for games that started before bot started:
+        - If already in Q3+ and halftime trigger not fired, fire it (catch-up)
+        """
         if self.has_fired(state.game_id, TriggerType.HALFTIME):
             return False
-        return state.is_halftime
+        
+        # Normal halftime detection
+        if state.is_halftime:
+            return True
+        
+        # Catch-up: if already past halftime (Q3+) and trigger hasn't fired, fire it now
+        # This handles the case where bot was restarted during a game
+        if state.period >= 3 and state.is_live:
+            logger.info(f"Catch-up: halftime trigger firing for {state.display_name} (already in Q{state.period})")
+            return True
+        
+        return False
 
     def check_q3_trigger(self, state: GameState) -> bool:
         """Check if Q3-5min trigger should fire."""

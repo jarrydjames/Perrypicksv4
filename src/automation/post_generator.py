@@ -87,6 +87,7 @@ class PostGenerator:
         game_state: GameState,
         recommendations: Optional[List[BettingRecommendation]] = None,
         passed_bets: Optional[List[BettingRecommendation]] = None,
+        odds_available: bool = True,
     ) -> GeneratedPost:
         """Generate a halftime prediction post with v3 template."""
         home_team = game_state.home_tricode or prediction.get("home_name", "Home")
@@ -104,7 +105,10 @@ class PostGenerator:
 
         # Build post using v3 template format
         lines = []
-        lines.append("🔥 HALFTIME UPDATE")
+        # VISUAL SEPARATOR - makes posts clearly distinct
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        lines.append("🔥 **HALFTIME UPDATE**")
         lines.append("")
         lines.append(f"**{away_team} @ {home_team}**")
         lines.append("")
@@ -122,16 +126,21 @@ class PostGenerator:
         lines.append("")
 
         # Add betting section
-        if self.include_betting and recommendations:
+        if self.include_betting:
             bet_lines = self._format_bets_section(
-                recommendations, passed_bets or [], home_team, away_team
+                recommendations or [],
+                passed_bets or [],
+                home_team,
+                away_team,
+                prediction,
+                odds_available,
             )
             lines.extend(bet_lines)
 
-        # Footer
+        # Footer with clear end marker
         lines.append("")
-        lines.append("---")
-        lines.append(f"*PerryPicks REPTAR Model | {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC*")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*PerryPicks REPTAR | {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC*")
 
         content = "\n".join(lines)
 
@@ -140,6 +149,70 @@ class PostGenerator:
             platform="discord",
             trigger_type=TriggerType.HALFTIME,
             game_id=game_state.game_id,
+            recommendations=recommendations or [],
+            passed_bets=passed_bets or [],
+            created_at=datetime.utcnow(),
+        )
+
+    def generate_pregame_post(
+        self,
+        prediction: dict,
+        home_team: str,
+        away_team: str,
+        game_time: str | None = None,
+        recommendations: Optional[List[BettingRecommendation]] = None,
+        passed_bets: Optional[List[BettingRecommendation]] = None,
+        odds_available: bool = True,
+    ) -> GeneratedPost:
+        """Generate a pregame prediction post (MAXIMUS)."""
+
+        pred_total = prediction.get("total_mean", prediction.get("pred_total", prediction.get("pred_final_total", 0)))
+        pred_margin = prediction.get("margin_mean", prediction.get("pred_margin", prediction.get("pred_final_margin", 0)))
+        pred_home = (pred_total + pred_margin) / 2
+        pred_away = (pred_total - pred_margin) / 2
+        home_win_prob = prediction.get("home_win_prob", 0.5)
+
+        winner = home_team if pred_margin > 0 else away_team
+        winner_prob = home_win_prob if pred_margin > 0 else (1 - home_win_prob)
+
+        lines = []
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        lines.append("🧠 **PREGAME**")
+        lines.append("")
+        lines.append(f"**{away_team} @ {home_team}**")
+        if game_time:
+            lines.append(f"Tip-off: {game_time}")
+        lines.append("")
+        lines.append(f"Projected Final: {away_team} {pred_away:.1f} - {pred_home:.1f} {home_team}")
+        lines.append("")
+        lines.append(f"Winner: **{winner}** | Margin: {pred_margin:+.1f} | Total: {pred_total:.1f}")
+        lines.append(f"Win Probability: {winner_prob:.1%} {winner}")
+        lines.append("")
+        lines.append(f"Team Totals: {away_team} {pred_away:.1f} | {home_team} {pred_home:.1f}")
+        lines.append("")
+
+        if self.include_betting:
+            bet_lines = self._format_bets_section(
+                recommendations or [],
+                passed_bets or [],
+                home_team,
+                away_team,
+                prediction,
+                odds_available,
+            )
+            lines.extend(bet_lines)
+
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        content = "\n".join(lines)
+
+        return GeneratedPost(
+            content=content[: self.DISCORD_MAX_CHARS],
+            platform="discord",
+            trigger_type=TriggerType.PREGAME,
+            game_id=str(prediction.get("game_id", "")),
             recommendations=recommendations or [],
             passed_bets=passed_bets or [],
             created_at=datetime.utcnow(),
@@ -166,7 +239,10 @@ class PostGenerator:
         winner = home_team if pred_margin > 0 else away_team
 
         lines = []
-        lines.append("⚡ Q3 UPDATE (5 Min Left)")
+        # VISUAL SEPARATOR - makes posts clearly distinct
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        lines.append("⚡ **Q3 UPDATE (5 Min Left)**")
         lines.append("")
         lines.append(f"**{away_team} @ {home_team}**")
         lines.append("")
@@ -182,15 +258,20 @@ class PostGenerator:
         lines.append("")
 
         # Add betting section
-        if self.include_betting and recommendations:
+        if self.include_betting:
             bet_lines = self._format_bets_section(
-                recommendations, passed_bets or [], home_team, away_team
+                recommendations or [],
+                passed_bets or [],
+                home_team,
+                away_team,
+                prediction,
+                odds_available,
             )
             lines.extend(bet_lines)
 
         lines.append("")
-        lines.append("---")
-        lines.append(f"*PerryPicks REPTAR Model | {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC*")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*PerryPicks REPTAR | {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC*")
 
         content = "\n".join(lines)
 
@@ -210,12 +291,21 @@ class PostGenerator:
         passed_bets: List[BettingRecommendation],
         home_team: str,
         away_team: str,
+        prediction: Optional[dict] = None,
+        odds_available: bool = True,
     ) -> List[str]:
-        """Format best bets section with v3 styling."""
+        """Format best bets section with v3 styling and Perry's Take."""
         lines = []
 
         if not bets:
-            lines.append("🎯 No bets passed edge + hit-probability thresholds at this time.")
+            if not odds_available:
+                lines.append("⚠️ **ERROR: Unable to fetch live odds from DraftKings**")
+                lines.append("")
+                lines.append("No betting recommendations available due to odds fetch error.")
+                lines.append("")
+                lines.append("Prediction is still valid - you may want to check odds manually.")
+            else:
+                lines.append("🎯 No bets passed edge + hit-probability thresholds at this time.")
         else:
             lines.append("🎯 **Best Bets** (sorted by edge, then hit probability)")
             lines.append("")
@@ -256,6 +346,14 @@ class PostGenerator:
             lines.append("📊 **Summary**")
             lines.append(f"   {len(bets)} bets | Avg Hit Prob: {avg_hit_prob:.1%} | Tiers: {tier_summary}")
 
+            # Perry's Take - add conversational insight based on stats
+            if prediction:
+                perrys_take = self._generate_perrys_take(bets, home_team, away_team, prediction)
+                if perrys_take:
+                    lines.append("")
+                    lines.append("**Perry's Take:**")
+                    lines.append(perrys_take)
+
         # Add passed bets section
         if passed_bets:
             lines.append("")
@@ -287,7 +385,8 @@ class PostGenerator:
         short: bool = False
     ) -> str:
         """Format the side/pick for a bet."""
-        bet_type_lower = bet.bet_type.lower()
+        # Normalize bet type (handle both "Team Total" and "team_total")
+        bet_type_lower = bet.bet_type.lower().replace(" ", "_")
 
         if bet_type_lower == "total":
             if short:
@@ -295,18 +394,25 @@ class PostGenerator:
             return f"{bet.pick} {bet.line:.1f}"
 
         elif bet_type_lower == "team_total":
-            team = bet.team_name or (home_team if bet.pick == "HOME" else away_team)
+            # For team totals, bet.team_name is already set correctly in the recommendation
+            # (home_team for home team totals, away_team for away team totals)
+            # bet.pick is "OVER" or "UNDER", not "HOME"/"AWAY"
+            if not bet.team_name:
+                logger.warning(f"Team total bet missing team_name: {bet}")
+                return f"Unknown {bet.pick} {bet.line:.1f}"
             if short:
-                return f"{team} {bet.pick} {bet.line:.1f}"
-            return f"{team} {bet.pick} {bet.line:.1f}"
+                return f"{bet.team_name} {bet.pick} {bet.line:.1f}"
+            return f"{bet.team_name} {bet.pick} {bet.line:.1f}"
 
         elif bet_type_lower == "spread":
+            # For spreads, bet.pick is "HOME" or "AWAY"
             team = bet.team_name or (home_team if bet.pick == "HOME" else away_team)
             if short:
                 return team
             return f"{team} {bet.line:+.1f}"
 
         else:  # ML
+            # For moneyline, bet.pick is "HOME" or "AWAY"
             team = bet.team_name or (home_team if bet.pick == "HOME" else away_team)
             if short:
                 return f"{team} ML"
@@ -488,6 +594,28 @@ class PostGenerator:
         # --- TEAM TOTALS ---
         team_total_home = odds.get("team_total_home")
         team_total_away = odds.get("team_total_away")
+        
+        # Derive team totals from game total and spread if not provided
+        if team_total_home is None and team_total_away is None:
+            total_points = odds.get("total_points")
+            spread_home = odds.get("spread_home")
+            
+            if total_points is not None and spread_home is not None:
+                # Formula (spread_home is home line, e.g., -3.5 means home is favored):
+                # Spread represents the expected margin: Home - Away = spread
+                # If spread is negative (home favored), home scores MORE, away scores LESS
+                # Home Team Total = (Game Total - Spread) / 2
+                # Away Team Total = (Game Total + Spread) / 2
+                # Example: Total 240.5, Spread -6.5 (home favored)
+                #   Home: (240.5 - (-6.5)) / 2 = 123.5 (home scores more!)
+                #   Away: (240.5 + (-6.5)) / 2 = 117.0 (away scores less!)
+                # Verify: 123.5 + 117.0 = 240.5 ✓
+                #           123.5 - 117.0 = 6.5 = -(-6.5) ✓
+                team_total_home = (total_points - spread_home) / 2
+                team_total_away = (total_points + spread_home) / 2
+                logger.info(f"Derived team totals from total={total_points}, spread={spread_home}")
+                logger.info(f"  Home team total: {team_total_home:.1f}")
+                logger.info(f"  Away team total: {team_total_away:.1f}")
 
         # Home team total
         if team_total_home is not None:
@@ -591,15 +719,101 @@ class PostGenerator:
     def _confidence_tier(self, probability: float) -> str:
         """Map probability to confidence tier."""
         p = float(probability)
-        if p >= 0.65:
+        if p >= 0.80:
             return "A+"
-        if p >= 0.62:
+        if p >= 0.75:
             return "A"
-        if p >= 0.59:
+        if p >= 0.65:
             return "B+"
         if p >= 0.56:
             return "B"
         return "No bet"
+
+    def _generate_perrys_take(
+        self,
+        bets: List[BettingRecommendation],
+        home_team: str,
+        away_team: str,
+        prediction: dict,
+    ) -> str:
+        """Generate conversational, statistically-backed insight for Perry's Take."""
+        if not bets:
+            return ""
+
+        # Get top recommendation
+        top_bet = bets[0]  # Already sorted by edge
+
+        # Extract stats from prediction
+        home_efg = prediction.get("home_efg", 0)
+        away_efg = prediction.get("away_efg", 0)
+        home_tor = prediction.get("home_tor", 0)
+        away_tor = prediction.get("away_tor", 0)
+        pred_margin = prediction.get("pred_final_margin", prediction.get("margin", 0))
+
+        # Build insights
+        insights = []
+
+        # Determine edge direction
+        if pred_margin > 0:
+            favored_team = home_team
+        else:
+            favored_team = away_team
+
+        # Edge statement based on top bet
+        if top_bet.bet_type.lower() == "ml":
+            edge_val = abs(top_bet.edge)
+            if edge_val >= 0.10:
+                insights.append(f"Clear edge to {favored_team}")
+                insights.append(f"The {edge_val:.0%} edge on {top_bet.team_name or top_bet.pick} ML is strong")
+            else:
+                insights.append(f"{edge_val:.0%} edge on {top_bet.team_name or top_bet.pick} ML")
+        elif top_bet.bet_type.lower() == "total":
+            edge_val = abs(top_bet.edge)
+            if edge_val >= 3:
+                insights.append(f"Solid {edge_val:.1f} pt edge on {top_bet.pick}")
+            else:
+                insights.append(f"{edge_val:.1f} pt edge on {top_bet.pick}")
+        elif top_bet.bet_type.lower() == "spread":
+            edge_val = abs(top_bet.edge)
+            if edge_val >= 2:
+                insights.append(f"Strong {edge_val:.1f} pt edge on {top_bet.team_name or favored_team}")
+            else:
+                insights.append(f"{edge_val:.1f} pt edge on {top_bet.team_name or favored_team}")
+
+        # Efficiency insights
+        if home_efg > 0 and away_efg > 0:
+            if home_efg >= 0.60:
+                insights.append(f"{home_team}'s eFG ({home_efg:.0%}) is elite")
+            elif home_efg >= 0.55 and home_efg > away_efg + 0.05:
+                insights.append(f"{home_team} shooting well ({home_efg:.0%} eFG)")
+
+            if away_efg >= 0.60:
+                insights.append(f"{away_team}'s eFG ({away_efg:.0%}) is elite")
+            elif away_efg >= 0.55 and away_efg > home_efg + 0.05:
+                insights.append(f"{away_team} shooting well ({away_efg:.0%} eFG)")
+
+        # Turnover insights (concerning if high)
+        if home_tor > 0.15:
+            insights.append(f"{home_team}'s TOR ({home_tor:.0%}) is concerning")
+        if away_tor > 0.15:
+            insights.append(f"{away_team}'s TOR ({away_tor:.0%}) is concerning")
+
+        # Build recommendation with action
+        rec_parts = []
+        for bet in bets[:2]:  # Top 2 recommendations
+            if bet.bet_type.lower() == "ml":
+                rec_parts.append(f"{bet.team_name or bet.pick} ML")
+            elif bet.bet_type.lower() == "spread":
+                rec_parts.append(f"{bet.team_name or bet.pick} {bet.line:+.1f}")
+            elif bet.bet_type.lower() == "total":
+                rec_parts.append(f"{bet.pick} {bet.line:.1f}")
+
+        # Format final take
+        take = " ".join(insights[:4])  # Max 4 insights for readability
+        if rec_parts:
+            take += f". Take {', '.join(rec_parts)}."
+
+        return take
 
 
 __all__ = ["PostGenerator", "GeneratedPost", "BettingRecommendation"]

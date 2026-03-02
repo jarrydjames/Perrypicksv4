@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+"""Discord view builder for market-implied tracking messages.
+
+Keep this separate from other Discord formatting to prevent cross-contamination
+with model-based language.
+"""
+
+from typing import Dict, Iterable
+
+from .types import StatusTier
+
+_TIER_EMOJI = {
+    StatusTier.STRONG: "🟢",
+    StatusTier.OK: "🔵",
+    StatusTier.WATCH: "🟡",
+    StatusTier.DANGER: "🟠",
+    StatusTier.EXIT: "🔴",
+}
+
+
+def _arrow(delta: float | None) -> str:
+    if delta is None:
+        return ""
+    if delta > 0:
+        return "▲"
+    if delta < 0:
+        return "▼"
+    return "→"
+
+
+def build_tracking_embed(
+    *,
+    matchup: str,
+    ticket_label: str,
+    live_label: str,
+    p_hit: float,
+    tier: StatusTier,
+    delta_2m: float | None,
+    move_pts: float | None,
+    move_detail: str | None = None,
+    updated_label: str | None = None,
+    notes: Iterable[str] = (),
+) -> Dict:
+    """Build a compact, glanceable embed (Version A).
+
+    Design goals:
+    - big % + bar
+    - minimal text
+    - trend + move signals
+    """
+
+    emoji = _TIER_EMOJI.get(tier, "⚪")
+    title = f"{emoji} Ticket Likelihood — {tier.value.upper()}"
+
+    p = max(0.0, min(1.0, float(p_hit)))
+    pct = int(round(p * 100))
+
+    # Unicode bar (16 segments)
+    segs = 16
+    filled = int(round(p * segs))
+    filled = max(0, min(segs, filled))
+    bar = "█" * filled + "░" * (segs - filled)
+
+    lines = [
+        f"**{matchup}**",
+        f"`{bar}`  **{pct}%**",
+        f"Ticket: {ticket_label}",
+    ]
+
+    if live_label:
+        lines.append(f"Now: {live_label}")
+
+    # Signals (split into separate lines with dividers)
+    divider = "────────────"
+
+    if delta_2m is not None:
+        lines.append(f"2m {_arrow(delta_2m)}{abs(delta_2m)*100:.0f}%")
+        lines.append(divider)
+
+    if move_detail:
+        lines.append(move_detail)
+        lines.append(divider)
+    elif move_pts is not None:
+        lines.append(f"Move {move_pts:+.1f}")
+        lines.append(divider)
+
+    if updated_label:
+        lines.append(updated_label)
+
+    return {
+        "title": title,
+        "description": "\n".join(lines)[:3900],
+        "color": 0x3498DB,
+    }
+
+
+
+def build_final_embed(
+    *,
+    matchup: str,
+    ticket_label: str,
+    final_score: str,
+    result: str,
+) -> Dict:
+    """Final edit when game ends."""
+
+    res = (result or "").lower().strip()
+    if res == "won":
+        emoji = "✅"
+        title = "✅ Final — WON (tracking stopped)"
+        color = 0x2ECC71
+    elif res == "push":
+        emoji = "➖"
+        title = "➖ Final — PUSH (tracking stopped)"
+        color = 0x95A5A6
+    else:
+        emoji = "❌"
+        title = "❌ Final — LOST (tracking stopped)"
+        color = 0xE74C3C
+
+    lines = [
+        f"**{matchup}**",
+        f"Final: {final_score}",
+        "",
+        f"**Ticket:** {ticket_label}",
+        f"**Result:** {emoji} {res.upper()}",
+    ]
+
+    return {
+        "title": title,
+        "description": "\n".join(lines)[:3900],
+        "color": color,
+        "footer": {"text": "tracking stopped"},
+    }

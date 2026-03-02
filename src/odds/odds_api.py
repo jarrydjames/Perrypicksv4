@@ -10,18 +10,23 @@ logger = logging.getLogger(__name__)
 
 import requests
 
-# Check if we should use the local Odds API
-USE_LOCAL_ODDS_API = os.getenv("USE_LOCAL_ODDS_API", "").lower() in ("true", "1", "yes")
+# IMPORTANT:
+# Decide local-vs-external at *call time*, not import time.
+# start.py sets USE_LOCAL_ODDS_API and ODDS_API_BASE_URL during boot.
+# If we read env only once at import time, other modules (or early imports)
+# may get stuck using the wrong provider.
 
-if USE_LOCAL_ODDS_API:
-    # Import the local client which has the same interface
+def _use_local_odds_api() -> bool:
+    return os.getenv("USE_LOCAL_ODDS_API", "").lower() in ("true", "1", "yes")
+
+
+def _get_local_client():
     from src.odds.local_odds_client import (
         fetch_nba_odds_snapshot as _local_fetch_nba_odds_snapshot,
-        OddsAPIMarketSnapshot as _LocalOddsAPIMarketSnapshot,
         OddsAPIError as _LocalOddsAPIError,
-        health_check as _local_health_check,
     )
-    logger.info("Using local Odds API (http://localhost:8890)")
+
+    return _local_fetch_nba_odds_snapshot, _LocalOddsAPIError
 
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
@@ -49,6 +54,10 @@ class OddsAPIMarketSnapshot:
     team_total_away: Optional[float]
     team_total_away_over_odds: Optional[int]
     team_total_away_under_odds: Optional[int]
+
+    # Derived team totals (calculated from spread + total when actual team totals unavailable)
+    derived_team_total_home: Optional[float] = None
+    derived_team_total_away: Optional[float] = None
 
     bookmaker: Optional[str] = None
     last_update: Optional[str] = None
@@ -122,19 +131,25 @@ def fetch_nba_odds_snapshot(
     - Otherwise falls back to the-odds-api.com (requires API key)
     """
     # Use local Odds API if available
-    if USE_LOCAL_ODDS_API:
+    if _use_local_odds_api():
         logger.info(f"Using local Odds API for {away_name} @ {home_name}")
-        local_snapshot = _local_fetch_nba_odds_snapshot(
-            home_name=home_name,
-            away_name=away_name,
-            regions=regions,
-            markets=markets,
-            odds_format=odds_format,
-            date_format=date_format,
-            preferred_book=preferred_book,
-            timeout_s=timeout_s,
-        )
-        # Convert to our OddsAPIMarketSnapshot format
+        _local_fetch_nba_odds_snapshot, _LocalOddsAPIError = _get_local_client()
+
+        try:
+            local_snapshot = _local_fetch_nba_odds_snapshot(
+                home_name=home_name,
+                away_name=away_name,
+                regions=regions,
+                markets=markets,
+                odds_format=odds_format,
+                date_format=date_format,
+                preferred_book=preferred_book,
+                timeout_s=timeout_s,
+            )
+        except _LocalOddsAPIError as e:
+            # IMPORTANT: unify error type so callers can reliably `except OddsAPIError`.
+            raise OddsAPIError(str(e)) from e
+
         return OddsAPIMarketSnapshot(
             total_points=local_snapshot.total_points,
             total_over_odds=local_snapshot.total_over_odds,
@@ -150,6 +165,8 @@ def fetch_nba_odds_snapshot(
             team_total_away=local_snapshot.team_total_away,
             team_total_away_over_odds=local_snapshot.team_total_away_over_odds,
             team_total_away_under_odds=local_snapshot.team_total_away_under_odds,
+            derived_team_total_home=getattr(local_snapshot, "derived_team_total_home", None),
+            derived_team_total_away=getattr(local_snapshot, "derived_team_total_away", None),
             bookmaker=local_snapshot.bookmaker,
             last_update=local_snapshot.last_update,
         )
@@ -413,6 +430,8 @@ def fetch_nba_odds_snapshot(
         team_total_away=team_total_away,
         team_total_away_over_odds=team_total_away_over_odds,
         team_total_away_under_odds=team_total_away_under_odds,
+        derived_team_total_home=None,  # Not available from external API
+        derived_team_total_away=None,  # Not available from external API
         bookmaker=book_key,
         last_update=last_update,
     )

@@ -2481,10 +2481,6 @@ function GameDetailModal({ gameId, onClose }) {
             </div>
           </div>
         ) : details ? (
-          <div className="p-8 flex items-center justify-center">
-            <RefreshCw size={24} className="animate-spin text-teal-400" />
-          </div>
-        ) : details ? (
           <>
             {/* Header */}
             <div className="bg-gradient-to-r from-teal-600 to-teal-500 px-6 py-4">

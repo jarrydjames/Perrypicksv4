@@ -5,7 +5,7 @@ Database models and session management for PerryPicks Dashboard.
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from sqlalchemy import create_engine, Column, Integer, Float, String, Boolean, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import create_engine, Column, Integer, Float, String, Boolean, DateTime, ForeignKey, Enum as SQLEnum, Index, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import enum
@@ -21,6 +21,7 @@ class BetType(enum.Enum):
     TOTAL = "total"
     SPREAD = "spread"
     MONEYLINE = "moneyline"
+    TEAM_TOTAL = "team_total"
 
 class BetStatus(enum.Enum):
     PENDING = "pending"
@@ -287,17 +288,156 @@ class LiveBetSnapshot(Base):
     game = relationship("Game")
 
 
+class MarketTrackingMessage(Base):
+    """One-to-one mapping from a recommendation to its live-tracking Discord message."""
+    __tablename__ = "market_tracking_messages"
+
+    id = Column(Integer, primary_key=True)
+
+    recommendation_id = Column(
+        Integer,
+        ForeignKey("betting_recommendations.id"),
+        nullable=False,
+        unique=True,
+    )
+
+    discord_message_id = Column(String(50), nullable=False)
+    status = Column(String(20), default="active")  # active|finalized|failed
+
+    # Used to enforce edit cadence across restarts
+    last_edited_at = Column(DateTime)
+
+    consecutive_edit_failures = Column(Integer, default=0)
+    last_error = Column(String(200))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    recommendation = relationship("BettingRecommendation")
+
+
+class MarketTrackingPoint(Base):
+    """Time-series point for market-implied p_hit history per recommendation."""
+    __tablename__ = "market_tracking_points"
+
+    id = Column(Integer, primary_key=True)
+
+    recommendation_id = Column(
+        Integer,
+        ForeignKey("betting_recommendations.id"),
+        nullable=False,
+    )
+
+    timestamp_utc = Column(DateTime, nullable=False)
+    p_hit = Column(Float, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    recommendation = relationship("BettingRecommendation")
+
+
+Index(
+    "ix_market_tracking_points_rec_ts",
+    MarketTrackingPoint.recommendation_id,
+    MarketTrackingPoint.timestamp_utc,
+)
+
+
+class Parlay(Base):
+    """A same-game parlay with multiple legs."""
+    __tablename__ = "parlays"
+
+    id = Column(Integer, primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+    prediction_id = Column(Integer, ForeignKey("predictions.id"), nullable=False)
+
+    # Parlay details
+    combined_probability = Column(Float)  # Product of individual probabilities
+    leg_count = Column(Integer)
+
+    # Outcome (parlay wins only if ALL legs win)
+    result = Column(SQLEnum(BetStatus), default=BetStatus.PENDING)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime)
+
+    game = relationship("Game")
+    prediction = relationship("Prediction")
+    legs = relationship("ParlayLeg", back_populates="parlay")
+
+
+class ParlayLeg(Base):
+    """Individual leg of a parlay."""
+    __tablename__ = "parlay_legs"
+
+    id = Column(Integer, primary_key=True)
+    parlay_id = Column(Integer, ForeignKey("parlays.id"), nullable=False)
+    recommendation_id = Column(Integer, ForeignKey("betting_recommendations.id"), nullable=False)
+
+    # Leg details (copied for historical record)
+    pick = Column(String(50))
+    bet_type = Column(String(20))
+    line = Column(Float)
+    probability = Column(Float)
+    edge = Column(Float)
+
+    # Outcome
+    result = Column(SQLEnum(BetStatus), default=BetStatus.PENDING)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    parlay = relationship("Parlay", back_populates="legs")
+    recommendation = relationship("BettingRecommendation")
+
+
 # Database setup - use absolute path to ensure consistent location
 DB_PATH = Path(__file__).parent / "perrypicks_dashboard.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 30})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
+    """Harden SQLite for multi-process use.
+
+    WAL + busy_timeout dramatically reduce random `database is locked` failures.
+    """
+
+    try:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+    except Exception:
+        pass
 
 
 def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
+
+    # Poor-man migrations for SQLite (keep schema changes minimal + explicit)
+    # This runs fast and is safe to re-run.
+    with engine.begin() as conn:
+        try:
+            cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info('market_tracking_messages')").fetchall()]
+            if 'last_edited_at' not in cols:
+                conn.exec_driver_sql("ALTER TABLE market_tracking_messages ADD COLUMN last_edited_at DATETIME")
+            if 'consecutive_edit_failures' not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE market_tracking_messages ADD COLUMN consecutive_edit_failures INTEGER DEFAULT 0"
+                )
+            if 'last_error' not in cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE market_tracking_messages ADD COLUMN last_error VARCHAR(200)"
+                )
+        except Exception:
+            # If table doesn't exist yet or SQLite complains, create_all already handled base tables.
+            pass
 
     # Create default ghost bettor config if not exists
     db = SessionLocal()

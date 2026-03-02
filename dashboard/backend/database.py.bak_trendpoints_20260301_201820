@@ -1,0 +1,411 @@
+"""
+Database models and session management for PerryPicks Dashboard.
+"""
+
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from sqlalchemy import create_engine, Column, Integer, Float, String, Boolean, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+import enum
+
+Base = declarative_base()
+
+class TriggerType(enum.Enum):
+    PREGAME = "pregame"
+    HALFTIME = "halftime"
+    Q3_5MIN = "q3_5min"
+
+class BetType(enum.Enum):
+    TOTAL = "total"
+    SPREAD = "spread"
+    MONEYLINE = "moneyline"
+    TEAM_TOTAL = "team_total"
+
+class BetStatus(enum.Enum):
+    PENDING = "pending"
+    WON = "won"
+    LOST = "lost"
+    PUSH = "push"
+
+class PredictionStatus(enum.Enum):
+    PENDING = "pending"
+    POSTED = "posted"       # Successfully posted to Discord
+    FAILED = "failed"       # Failed to post to Discord
+    CORRECT = "correct"
+    WRONG = "wrong"
+
+
+class Game(Base):
+    """NBA game record."""
+    __tablename__ = "games"
+
+    id = Column(Integer, primary_key=True)
+    nba_id = Column(String(20), unique=True, nullable=True)
+    game_date = Column(DateTime, nullable=False)
+    home_team = Column(String(10), nullable=False)
+    away_team = Column(String(10), nullable=False)
+    home_team_name = Column(String(50))
+    away_team_name = Column(String(50))
+    game_time = Column(DateTime)  # Scheduled tip-off
+
+    # Final results (populated after game)
+    final_home_score = Column(Integer)
+    final_away_score = Column(Integer)
+    final_total = Column(Float)
+    final_margin = Column(Float)  # home - away
+    game_status = Column(String(50))  # scheduled, In Progress, End of 1st, Halftime, Final
+
+    # Live game info
+    period = Column(Integer, default=0)  # Current period (1-4 for regulation, 5+ for OT)
+    clock = Column(String(10))  # Game clock (e.g., "7:42")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    predictions = relationship("Prediction", back_populates="game")
+    ghost_bets = relationship("GhostBet", back_populates="game")
+
+
+class Prediction(Base):
+    """A prediction made by the model."""
+    __tablename__ = "predictions"
+
+    id = Column(Integer, primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+    trigger_type = Column(SQLEnum(TriggerType), nullable=False)
+
+    # Halftime/Q3 scores at prediction time
+    h1_home = Column(Integer)
+    h1_away = Column(Integer)
+    q3_home = Column(Integer)
+    q3_away = Column(Integer)
+
+    # Predictions
+    pred_total = Column(Float)
+    pred_margin = Column(Float)
+    pred_home_score = Column(Float)
+    pred_away_score = Column(Float)
+    pred_winner = Column(String(10))  # home or away team code
+    home_win_prob = Column(Float)
+
+    # Confidence intervals
+    total_q10 = Column(Float)
+    total_q90 = Column(Float)
+    margin_q10 = Column(Float)
+    margin_q90 = Column(Float)
+
+    # Outcome tracking
+    status = Column(SQLEnum(PredictionStatus), default=PredictionStatus.PENDING)
+    actual_total = Column(Float)
+    actual_margin = Column(Float)
+    actual_winner = Column(String(10))
+    total_error = Column(Float)  # |pred - actual|
+    margin_error = Column(Float)
+    winner_correct = Column(Boolean)
+
+    posted_to_discord = Column(Boolean, default=False)
+    discord_message_id = Column(String(50))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime)
+
+    game = relationship("Game", back_populates="predictions")
+    recommendations = relationship("BettingRecommendation", back_populates="prediction")
+
+
+class BettingRecommendation(Base):
+    """A betting recommendation from a prediction."""
+    __tablename__ = "betting_recommendations"
+
+    id = Column(Integer, primary_key=True)
+    prediction_id = Column(Integer, ForeignKey("predictions.id"), nullable=False)
+
+    bet_type = Column(SQLEnum(BetType), nullable=False)
+    pick = Column(String(20))  # OVER, UNDER, HOME, AWAY
+    line = Column(Float)
+    odds = Column(Integer)
+    edge = Column(Float)
+    probability = Column(Float)
+    confidence_tier = Column(String(5))  # A+, A, B+, B
+    model_prediction = Column(Float)
+
+    # Outcome
+    result = Column(SQLEnum(BetStatus), default=BetStatus.PENDING)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    prediction = relationship("Prediction", back_populates="recommendations")
+    ghost_bets = relationship("GhostBet", back_populates="recommendation")
+
+
+class GhostBet(Base):
+    """A paper bet placed by the ghost bettor."""
+    __tablename__ = "ghost_bets"
+
+    id = Column(Integer, primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+    recommendation_id = Column(Integer, ForeignKey("betting_recommendations.id"), nullable=False)
+
+    bet_type = Column(SQLEnum(BetType), nullable=False)
+    pick = Column(String(20))
+    line = Column(Float)
+    odds = Column(Integer)
+    edge = Column(Float)
+    probability = Column(Float)
+    confidence_tier = Column(String(5))
+
+    bet_amount = Column(Float, nullable=False)  # $ amount wagered
+    potential_payout = Column(Float)  # $ amount if won
+
+    result = Column(SQLEnum(BetStatus), default=BetStatus.PENDING)
+    actual_payout = Column(Float, default=0.0)  # $ won/lost
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime)
+
+    game = relationship("Game", back_populates="ghost_bets")
+    recommendation = relationship("BettingRecommendation", back_populates="ghost_bets")
+
+
+class GhostBettorConfig(Base):
+    """Configuration for the ghost bettor."""
+    __tablename__ = "ghost_bettor_config"
+
+    id = Column(Integer, primary_key=True)
+
+    starting_bankroll = Column(Float, default=1000.0)
+    current_bankroll = Column(Float, default=1000.0)
+    default_bet_amount = Column(Float, default=10.0)
+
+    # Thresholds by bet type
+    total_min_edge = Column(Float, default=2.0)
+    total_min_prob = Column(Float, default=0.56)
+    spread_min_edge = Column(Float, default=1.5)
+    spread_min_prob = Column(Float, default=0.57)
+    ml_min_edge = Column(Float, default=0.03)
+    ml_min_prob = Column(Float, default=0.58)
+
+    # Limits
+    max_bets_per_game = Column(Integer, default=3)
+    max_bets_per_day = Column(Integer, default=20)
+
+    is_active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SystemConfig(Base):
+    """System configuration for triggers and features."""
+    __tablename__ = "system_config"
+
+    id = Column(Integer, primary_key=True)
+
+    # Trigger toggles
+    pregame_enabled = Column(Boolean, default=True)
+    halftime_enabled = Column(Boolean, default=True)
+    q3_5min_enabled = Column(Boolean, default=True)
+
+    # Odds fetching
+    odds_fetch_enabled = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PerformanceSnapshot(Base):
+    """Daily performance snapshot for tracking over time."""
+    __tablename__ = "performance_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    snapshot_date = Column(DateTime, nullable=False, unique=True)
+
+    # Prediction metrics
+    total_predictions = Column(Integer, default=0)
+    correct_predictions = Column(Integer, default=0)
+    pending_predictions = Column(Integer, default=0)
+    total_mae = Column(Float)
+    margin_mae = Column(Float)
+    win_rate = Column(Float)
+
+    # Ghost bettor metrics
+    total_bets = Column(Integer, default=0)
+    bets_won = Column(Integer, default=0)
+    bets_lost = Column(Integer, default=0)
+    bets_pending = Column(Integer, default=0)
+    total_wagered = Column(Float, default=0.0)
+    total_payout = Column(Float, default=0.0)
+    profit_loss = Column(Float, default=0.0)
+    roi = Column(Float)
+    bankroll = Column(Float)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LiveBetSnapshot(Base):
+    """Live tracking of bet probability over time during a game."""
+    __tablename__ = "live_bet_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    recommendation_id = Column(Integer, ForeignKey("betting_recommendations.id"), nullable=False)
+    prediction_id = Column(Integer, ForeignKey("predictions.id"), nullable=False)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+
+    # Game state at snapshot
+    period = Column(Integer)           # 1, 2, 3, 4, 5+ (OT)
+    clock = Column(String(10))         # "8:42"
+    home_score = Column(Integer)       # Current home score
+    away_score = Column(Integer)       # Current away score
+    game_seconds_remaining = Column(Integer)  # Total seconds left in game
+
+    # Prediction values (from halftime)
+    pred_total = Column(Float)         # Predicted final total
+    pred_margin = Column(Float)        # Predicted final margin (home - away)
+    bet_type = Column(String(20))      # total, spread, moneyline
+    bet_pick = Column(String(20))      # OVER, UNDER, HOME, AWAY
+    bet_line = Column(Float)           # The line we bet on
+
+    # Live probability calculation
+    points_needed = Column(Float)      # Points still needed for bet to hit
+    time_remaining = Column(Integer)   # Seconds remaining
+    scoring_rate = Column(Float)       # Points per minute expected
+    live_probability = Column(Float)   # Calculated probability bet hits (0-1)
+
+    # Alert tracking
+    alert_sent = Column(Boolean, default=False)  # Whether we sent 80%/20% alert
+    alert_type = Column(String(20))   # "high_confidence", "cashout", None
+
+    # Live odds (if available)
+    live_line = Column(Float)          # Current market line
+    live_odds = Column(Integer)        # Current market odds
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    recommendation = relationship("BettingRecommendation")
+    prediction = relationship("Prediction")
+    game = relationship("Game")
+
+
+class MarketTrackingMessage(Base):
+    """One-to-one mapping from a recommendation to its live-tracking Discord message."""
+    __tablename__ = "market_tracking_messages"
+
+    id = Column(Integer, primary_key=True)
+
+    recommendation_id = Column(
+        Integer,
+        ForeignKey("betting_recommendations.id"),
+        nullable=False,
+        unique=True,
+    )
+
+    discord_message_id = Column(String(50), nullable=False)
+    status = Column(String(20), default="active")  # active|finalized|failed
+
+    # Used to enforce edit cadence across restarts
+    last_edited_at = Column(DateTime)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    recommendation = relationship("BettingRecommendation")
+
+
+class Parlay(Base):
+    """A same-game parlay with multiple legs."""
+    __tablename__ = "parlays"
+
+    id = Column(Integer, primary_key=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+    prediction_id = Column(Integer, ForeignKey("predictions.id"), nullable=False)
+
+    # Parlay details
+    combined_probability = Column(Float)  # Product of individual probabilities
+    leg_count = Column(Integer)
+
+    # Outcome (parlay wins only if ALL legs win)
+    result = Column(SQLEnum(BetStatus), default=BetStatus.PENDING)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    resolved_at = Column(DateTime)
+
+    game = relationship("Game")
+    prediction = relationship("Prediction")
+    legs = relationship("ParlayLeg", back_populates="parlay")
+
+
+class ParlayLeg(Base):
+    """Individual leg of a parlay."""
+    __tablename__ = "parlay_legs"
+
+    id = Column(Integer, primary_key=True)
+    parlay_id = Column(Integer, ForeignKey("parlays.id"), nullable=False)
+    recommendation_id = Column(Integer, ForeignKey("betting_recommendations.id"), nullable=False)
+
+    # Leg details (copied for historical record)
+    pick = Column(String(50))
+    bet_type = Column(String(20))
+    line = Column(Float)
+    probability = Column(Float)
+    edge = Column(Float)
+
+    # Outcome
+    result = Column(SQLEnum(BetStatus), default=BetStatus.PENDING)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    parlay = relationship("Parlay", back_populates="legs")
+    recommendation = relationship("BettingRecommendation")
+
+
+# Database setup - use absolute path to ensure consistent location
+DB_PATH = Path(__file__).parent / "perrypicks_dashboard.db"
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def init_db():
+    """Initialize database tables."""
+    Base.metadata.create_all(bind=engine)
+
+    # Poor-man migrations for SQLite (keep schema changes minimal + explicit)
+    # This runs fast and is safe to re-run.
+    with engine.begin() as conn:
+        try:
+            cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info('market_tracking_messages')").fetchall()]
+            if 'last_edited_at' not in cols:
+                conn.exec_driver_sql("ALTER TABLE market_tracking_messages ADD COLUMN last_edited_at DATETIME")
+        except Exception:
+            # If table doesn't exist yet or SQLite complains, create_all already handled base tables.
+            pass
+
+    # Create default ghost bettor config if not exists
+    db = SessionLocal()
+    try:
+        config = db.query(GhostBettorConfig).first()
+        if not config:
+            config = GhostBettorConfig()
+            db.add(config)
+            db.commit()
+
+        # Create default system config if not exists
+        sys_config = db.query(SystemConfig).first()
+        if not sys_config:
+            sys_config = SystemConfig()
+            db.add(sys_config)
+            db.commit()
+    finally:
+        db.close()
+
+
+def get_db():
+    """Get database session."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

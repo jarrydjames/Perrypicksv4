@@ -1,0 +1,775 @@
+{
+  "meta": {
+    "version": "1.2.0",
+    "created": "2026-02-26",
+    "author": "Perry (code-puppy-724a09)",
+    "purpose": "Persistent context library for PerryPicks system - use this FIRST when encountering any issue",
+    "last_updated": "2026-02-27"
+  },
+  
+  "system_overview": {
+    "name": "PerryPicks v4",
+    "purpose": "Automated NBA halftime prediction system using Reptar ML model",
+    "architecture": [
+      "Automation Service (start.py) - Main daemon",
+      "Game State Monitor - Polls NBA CDN for live games",
+      "Trigger Engine - Detects halftime, Q3 5min events",
+      "Prediction Generator - Creates betting recommendations",
+      "Discord Bot - Posts predictions to Discord",
+      "Health Watchdog (watchdog.py) - Monitors all components",
+      "Dashboard API - Web interface",
+      "Odds API - Fetches live betting odds"
+    ],
+    "data_flow": [
+      "1. Schedule fetched from ESPN/NBA CDN",
+      "2. Games stored in SQLite database",
+      "3. Game State Monitor polls NBA CDN every 30s",
+      "4. When game reaches halftime/Q3-5min, trigger fires",
+      "5. Prediction generated using Reptar model",
+      "6. Live odds fetched from bookmakers",
+      "7. Recommendations created (spread, total, ML props)",
+      "8. Prediction posted to Discord"
+    ]
+  },
+  
+  "critical_files": {
+    "main_automation": {
+      "path": "start.py",
+      "purpose": "Main automation daemon entry point",
+      "key_functions": [
+        "_update_game_statuses() - Updates game status from ESPN",
+        "_check_and_queue_games() - Re-queues games on date change",
+        "_run_halftime_trigger() - Processes halftime events",
+        "_run_q3_5min_trigger() - Processes Q3 5min events"
+      ],
+      "important": "This is the main process that must be running"
+    },
+    "watchdog": {
+      "path": "watchdog.py",
+      "purpose": "Health monitoring daemon",
+      "key_functions": [
+        "_check_automation() - Checks if main process running",
+        "_check_backend() - Backend API health",
+        "_check_odds_api() - Odds API health",
+        "_check_database() - Database connectivity",
+        "_check_stuck_states() - Stale predictions, API failures",
+        "_restart_automation() - Restarts main process"
+      ],
+      "important": "Runs independently, can restart automation"
+    },
+    "database": {
+      "path": "dashboard/backend/database.py",
+      "purpose": "SQLAlchemy ORM models and session management",
+      "tables": ["games", "predictions", "ghost_bets", "bankrolls", "system_stats", "prediction_bets", "parlays", "alerts"]
+    },
+    "game_state_monitor": {
+      "path": "src/automation/game_state.py",
+      "purpose": "Polls NBA CDN for live game updates",
+      "key_functions": [
+        "update_all_games() - Updates all tracked games",
+        "get_live_games() - Gets currently live games"
+      ],
+      "important": "Uses NBA CDN boxscore endpoints"
+    },
+    "prediction_generator": {
+      "path": "src/discord_bot/prediction_generator.py",
+      "purpose": "Creates betting recommendations",
+      "key_functions": [
+        "generate_halftime_post() - Generates halftime predictions",
+        "_calculate_edge() - Calculates betting edge",
+        "_confidence_tier() - Determines confidence grade"
+      ],
+      "important": "Implements odds retry logic, team matching"
+    },
+    "discord_bot": {
+      "path": "src/discord_bot/discord_bot.py",
+      "purpose": "Posts predictions to Discord",
+      "key_functions": [
+        "send_discord_message() - Sends messages via webhook"
+      ],
+      "important": "Uses DISCORD_WEBHOOK_URL env var"
+    },
+    "schedule": {
+      "path": "src/schedule.py",
+      "purpose": "Fetches game schedules from ESPN/NBA CDN",
+      "key_functions": [
+        "fetch_schedule() - Main schedule fetch function",
+        "get_nba_ids() - Gets NBA IDs for games"
+      ],
+      "important": "Handles team name/tricode normalization"
+    }
+  },
+  
+  "database_schema": {
+    "games": {
+      "primary_key": "id",
+      "important_fields": [
+        "id - Internal ID",
+        "nba_id - NBA game ID (0022500855)",
+        "home_team - Tricode (PHX, LAL)",
+        "away_team - Tricode (LAL, PHX)",
+        "game_status - Scheduled, In Progress, Halftime, Final",
+        "period - Current quarter (1-4, 5+ for OT)",
+        "clock - Game clock (e.g., '7:42')",
+        "updated_at - When game was last updated"
+      ],
+      "critical": "Trigger checks game_status, period, clock"
+    },
+    "predictions": {
+      "primary_key": "id",
+      "important_fields": [
+        "id - Prediction ID",
+        "game_id - Foreign key to games table",
+        "trigger_type - pregame, halftime, q3_5min",
+        "status - pending, posted, failed, correct, wrong",
+        "posted_to_discord - Boolean",
+        "created_at - Timestamp"
+      ],
+      "critical": "Watchdog checks for stale (>4h old, not posted)"
+    },
+    "ghost_bets": {
+      "primary_key": "id",
+      "important_fields": [
+        "id - Bet ID",
+        "game_id - Foreign key",
+        "bet_type - total, spread, moneyline, team_total",
+        "result - pending, won, lost, push",
+        "actual_payout - $ amount won/lost"
+      ]
+    }
+  },
+  
+  "environment_variables": {
+    "DISCORD_WEBHOOK_URL": {
+      "purpose": "Discord webhook for predictions",
+      "required": true,
+      "fallback": "DISCORD_ALERTS_WEBHOOK"
+    },
+    "DISCORD_ALERTS_WEBHOOK": {
+      "purpose": "Discord webhook for watchdog alerts",
+      "required": false,
+      "notes": "If not set, uses DISCORD_WEBHOOK_URL"
+    },
+    "USE_LOCAL_ODDS_API": {
+      "purpose": "Use local odds API service",
+      "required": false,
+      "default": "false",
+      "values": ["true", "false"]
+    },
+    "DATABASE_URL": {
+      "purpose": "SQLite database path",
+      "required": false,
+      "default": "sqlite:///dashboard/backend/perrypicks.db"
+    }
+  },
+  
+  "common_errors": {
+    "game_not_updating": {
+      "symptoms": [
+        "Game at halftime but no prediction posted",
+        "Database shows 'Scheduled' when game is live",
+        "Logs show '403 Forbidden' from NBA CDN",
+        "Logs show 'timeout' from ESPN"
+      ],
+      "root_cause": [
+        "NBA CDN rate limiting (403 Forbidden)",
+        "ESPN API connectivity issues (timeout)",
+        "Network issues"
+      ],
+      "detection": "Watchdog: 'X games not updating (API failure)'",
+      "immediate_fix": [
+        "Option 1: Manually update game status in database",
+        "Option 2: Wait for APIs to recover",
+        "Option 3: Restart automation"
+      ],
+      "manual_update_sql": [
+        "UPDATE games",
+        "SET game_status = 'Halftime', period = 2, clock = '0:00', updated_at = datetime('now')",
+        "WHERE id = <game_id>"
+      ],
+      "long_term_fix": [
+        "Reduce NBA CDN polling frequency",
+        "Add retry logic with exponential backoff",
+        "Use ESPN as fallback for live data"
+      ]
+    },
+    
+    "trigger_not_firing": {
+      "symptoms": [
+        "Game at halftime but no prediction created",
+        "Trigger logic should have fired but didn't",
+        "Game status updated correctly but no prediction"
+      ],
+      "root_cause": [
+        "Trigger not checking correct status value",
+        "Trigger not being called at all",
+        "Trigger disabled in configuration",
+        "Bug in trigger logic"
+      ],
+      "detection": "Watchdog can't detect this (logic bug)",
+      "troubleshooting_steps": [
+        "1. Check trigger configuration in start.py",
+        "2. Check if trigger is enabled",
+        "3. Check game status in database",
+        "4. Check logs for trigger activity",
+        "5. Manually trigger prediction to test"
+      ],
+      "manual_trigger": [
+        "Call prediction generation directly:",
+        "python3 -c 'from src.discord_bot.prediction_generator import generate_halftime_post; generate_halftime_post(<game_id>)'"
+      ]
+    },
+    
+    "odds_fetch_failure": {
+      "symptoms": [
+        "Prediction created but has no odds",
+        "Bets show 'Odds: N/A'",
+        "Logs show timeout or connection errors from odds API"
+      ],
+      "root_cause": [
+        "Odds API not responding",
+        "Bookmaker API rate limiting",
+        "Network issues",
+        "Invalid game ID"
+      ],
+      "detection": "Watchdog can't detect (HTTP 200 OK, but no data)",
+      "immediate_fix": [
+        "1. Check odds API status",
+        "2. Check logs for error messages",
+        "3. Retry manually",
+        "4. Use different bookmaker API"
+      ],
+      "code_location": "src/discord_bot/prediction_generator.py - odds retry logic",
+      "retry_logic": {
+        "attempts": 8,
+        "backoff": "exponential",
+        "total_time": "8 minutes",
+        "implemented": true
+      }
+    },
+    
+    "discord_posting_failure": {
+      "symptoms": [
+        "Prediction created but not posted",
+        "Logs show prediction generated",
+        "Database shows posted_to_discord = False",
+        "No Discord message received"
+      ],
+      "root_cause": [
+        "Invalid webhook URL",
+        "Discord webhook deleted/expired",
+        "Discord rate limiting",
+        "Webhook permissions issue",
+        "Network issues"
+      ],
+      "detection": "Watchdog: 'stale predictions (>4 hours old, not posted)'",
+      "immediate_fix": [
+        "1. Verify webhook URL in .env",
+        "2. Test webhook manually:",
+        "   curl -X POST -H 'Content-Type: application/json' -d '{\"content\": \"test\"}' <webhook_url>",
+        "3. Check Discord server permissions",
+        "4. Update webhook URL and restart"
+      ],
+      "code_location": "src/discord_bot/discord_bot.py"
+    },
+    
+    "team_matching_failure": {
+      "symptoms": [
+        "Prediction missing teams",
+        "'Team: None' in post",
+        "Bets for wrong teams"
+      ],
+      "root_cause": [
+        "Team tricodes don't match",
+        "Team names don't match",
+        "Nickname vs city name mismatch"
+      ],
+      "detection": "Visual inspection of Discord posts",
+      "immediate_fix": [
+        "1. Check team tricodes in database",
+        "2. Check team tricodes from NBA CDN",
+        "3. Update team mapping in code",
+        "4. Use tricode-first matching (implemented)"
+      ],
+      "code_location": "src/discord_bot/prediction_generator.py - team matching",
+      "current_logic": {
+        "priority": ["Tricode", "City", "Name"],
+        "tricodes": "BOS, LAL, GSW, etc.",
+        "fallback": "Try city/name if tricode fails"
+      }
+    },
+    
+    "team_total_odds_flipped": {
+      "symptoms": [
+        "Team total bets assigned to wrong team",
+        "Home team total shows as away team bet",
+        "Away team total shows as home team bet",
+        "Betting recommendations for team totals are incorrect"
+      ],
+      "root_cause": [
+        "_format_bet_side() function uses incorrect fallback logic",
+        "For team totals, bet.pick = 'OVER'/'UNDER' (not 'HOME'/'AWAY')",
+        "Fallback condition 'bet.pick == \"HOME\"' always False",
+        "Result: All team totals default to away_team"
+      ],
+      "detection": "Visual inspection of Discord posts showing wrong team for team total bets",
+      "immediate_fix": [
+        "1. Fixed in src/automation/post_generator.py",
+        "2. Removed incorrect fallback logic for team totals",
+        "3. Now trust bet.team_name which is set correctly in recommendations",
+        "4. Added warning if bet.team_name is None"
+      ],
+      "code_location": "src/automation/post_generator.py - _format_bet_side()",
+      "old_buggy_code": "team = bet.team_name or (home_team if bet.pick == 'HOME' else away_team)",
+      "fixed_code": "if not bet.team_name: logger.warning(...); return f'{bet.team_name} {bet.pick} {bet.line}'",
+      "fixed_date": "2026-02-26",
+      "important_note": "Team total recommendations set team_name correctly during creation, but display logic was using wrong fallback"
+    },
+    
+    "low_confidence_bets": {
+      "symptoms": [
+        "Bets with 55-60% confidence being posted",
+        "User feedback: too many low-confidence bets"
+      ],
+      "root_cause": [
+        "Confidence threshold too low",
+        "Minimum confidence not enforced"
+      ],
+      "detection": "User reports / manual review",
+      "immediate_fix": [
+        "1. Check confidence thresholds in prediction_generator.py",
+        "2. Update _confidence_tier() function",
+        "3. Enforce minimum confidence before posting"
+      ],
+      "current_thresholds": {
+        "A_Tier": "80%+",
+        "B_Tier": "75-79%",
+        "C_Tier": "70-74%",
+        "Below_70%": "Not posted"
+      }
+    },
+    
+    "memory_issues": {
+      "symptoms": [
+        "System slow",
+        "Process killed",
+        "Watchdog: 'Memory: Critical (>90%)'
+      ],
+      "root_cause": [
+        "Reptar model not being unloaded",
+        "Memory leak",
+        "Too many cached games",
+        "Too many open database connections"
+      ],
+      "detection": "Watchdog memory check",
+      "immediate_fix": [
+        "1. Restart automation",
+        "2. Clear cache",
+        "3. Close unused database connections",
+        "4. Increase system memory"
+      ],
+      "code_locations": [
+        "Reptar loading: src/reptar_integration.py",
+        "Cache: src/data/game_data.py"
+      ]
+    }
+  },
+  
+  "critical_processes": {
+    "main_automation": {
+      "name": "Automation Service",
+      "pid_file": ".perrypicks.pid",
+      "start_command": "python start.py",
+      "start_script": "./start_with_watchdog.sh",
+      "stop_command": "kill -15 $(cat .perrypicks.pid)",
+      "check_running": "ps -p $(cat .perrypicks.pid)",
+      "important": "MUST be running for system to work"
+    },
+    
+    "watchdog": {
+      "name": "Health Watchdog",
+      "pid_file": ".watchdog.pid",
+      "start_command": "python watchdog.py",
+      "start_script": "./start_with_watchdog.sh",
+      "stop_command": "kill -15 $(cat .watchdog.pid)",
+      "check_running": "ps -p $(cat .watchdog.pid)",
+      "important": "Should run independently of automation"
+    },
+    
+    "backend_api": {
+      "name": "Dashboard Backend",
+      "port": 8000,
+      "health_endpoint": "/api/health",
+      "start_command": "Starts with automation",
+      "important": "Provides web interface"
+    },
+    
+    "odds_api": {
+      "name": "Odds API",
+      "port": 8890,
+      "health_endpoint": "/v1/health",
+      "env_var": "USE_LOCAL_ODDS_API",
+      "important": "Fetches live betting odds"
+    }
+  },
+  
+  "remediation_procedures": {
+    "manual_game_status_update": {
+      "when_to_use": "Game at halftime but database not updated",
+      "steps": [
+        "1. Find game ID:",
+        "   SELECT id, home_team, away_team FROM games WHERE home_team = 'PHX'",
+        "2. Update game status:",
+        "   UPDATE games SET game_status = 'Halftime', period = 2, clock = '0:00' WHERE id = <id>",
+        "3. Verify update:",
+        "   SELECT game_status, period, clock FROM games WHERE id = <id>",
+        "4. Wait 10 seconds for trigger",
+        "5. Check if prediction created"
+      ],
+      "automation": "Can be done via Python script"
+    },
+    
+    "restart_automation": {
+      "when_to_use": "Automation not responding, crashed, or stuck",
+      "steps": [
+        "1. Graceful stop: kill -15 $(cat .perrypicks.pid)",
+        "2. Wait 5 seconds",
+        "3. Force kill if needed: kill -9 $(cat .perrypicks.pid)",
+        "4. Start: python start.py",
+        "5. Wait 10 seconds",
+        "6. Verify: ps -p $(cat .perrypicks.pid)"
+      ],
+      "script": "./stop_with_watchdog.sh && ./start_with_watchdog.sh"
+    },
+    
+    "restart_watchdog": {
+      "when_to_use": "Watchdog not working, needs update",
+      "steps": [
+        "1. Stop: kill -15 $(cat .watchdog.pid)",
+        "2. Remove PID file: rm .watchdog.pid",
+        "3. Start: python watchdog.py",
+        "4. Verify: ps -p $(cat .watchdog.pid)"
+      ]
+    },
+    
+    "check_prediction_status": {
+      "when_to_use": "Need to see if prediction was created/posted",
+      "steps": [
+        "1. Check recent predictions:",
+        "   SELECT p.id, g.home_team, g.away_team, p.trigger_type, p.status, p.posted_to_discord, p.created_at",
+        "   FROM predictions p JOIN games g ON p.game_id = g.id",
+        "   WHERE p.created_at > datetime('now', '-1 hour')",
+        "   ORDER BY p.created_at DESC",
+        "2. Check status: 'pending' = created, 'posted' = success, 'failed' = error",
+        "3. Check posted_to_discord: True = sent, False = not sent"
+      ]
+    },
+    
+    "test_discord_webhook": {
+      "when_to_use": "Discord not receiving predictions",
+      "steps": [
+        "1. Get webhook URL from .env",
+        "2. Test manually:",
+        "   curl -X POST -H 'Content-Type: application/json' -d '{\"content\": \"Test from Perry\"}' <WEBHOOK_URL>",
+        "3. Check Discord for message",
+        "4. If error: update webhook URL"
+      ]
+    }
+  },
+  
+  "database_queries": {
+    "get_todays_games": {
+      "query": "SELECT * FROM games WHERE DATE(game_date) = DATE('now')",
+      "purpose": "Get all games scheduled for today"
+    },
+    
+    "get_games_at_halftime": {
+      "query": "SELECT * FROM games WHERE game_status = 'Halftime' OR (period = 2 AND game_status LIKE '%Halftime%')",
+      "purpose": "Find games currently at halftime"
+    },
+    
+    "get_recent_predictions": {
+      "query": "SELECT * FROM predictions WHERE created_at > datetime('now', '-1 hour') ORDER BY created_at DESC",
+      "purpose": "Get predictions created in last hour"
+    },
+    
+    "get_stale_predictions": {
+      "query": "SELECT * FROM predictions WHERE created_at < datetime('now', '-4 hours') AND posted_to_discord = 0",
+      "purpose": "Find predictions that were never posted (watchdog check)"
+    },
+    
+    "get_games_not_updating": {
+      "query": "SELECT * FROM games WHERE DATE(game_date) = DATE('now') AND (updated_at IS NULL OR updated_at < datetime('now', '-5 minutes')) AND game_status NOT IN ('Final', 'Scheduled')",
+      "purpose": "Find games not being updated (API failure detection)"
+    }
+  },
+  
+  "api_endpoints": {
+    "nba_cdn_boxscore": {
+      "url_template": "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_<game_id>.json",
+      "purpose": "Live game data (score, period, clock)",
+      "rate_limit": "403 Forbidden if too many requests",
+      "workaround": "Use ESPN as fallback"
+    },
+    
+    "espn_scoreboard": {
+      "url_template": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=<YYYYMMDD>",
+      "purpose": "Game schedule and basic status",
+      "timeout": "10 seconds default"
+    },
+    
+    "backend_health": {
+      "url": "http://localhost:8000/api/health",
+      "method": "GET",
+      "expected": "HTTP 200"
+    },
+    
+    "odds_api_health": {
+      "url": "http://localhost:8890/v1/health",
+      "method": "GET",
+      "expected": "HTTP 200"
+    }
+  },
+  
+  "workflows": {
+    "halftime_prediction_flow": [
+      "1. Game reaches halftime (period = 2, clock = 0:00)",
+      "2. Game State Monitor detects halftime",
+      "3. Trigger Engine fires HALFTIME event",
+      "4. Automation calls _run_halftime_trigger()",
+      "5. Fetches box score from NBA CDN",
+      "6. Loads Reptar ML model",
+      "7. Generates predictions (total, spread, ML props)",
+      "8. Fetches live odds from bookmakers (8 retries)",
+      "9. Filters bad odds (< -300), matches teams",
+      "10. Calculates confidence, edge, hit probability",
+      "11. Determines confidence tier (A/B/C)",
+      "12. Creates Discord post message",
+      "13. Posts to Discord webhook",
+      "14. Saves prediction to database"
+    ],
+    
+    "watchdog_monitoring_flow": [
+      "1. Every 60 seconds, run health checks",
+      "2. Check if automation process running",
+      "3. Check backend API health",
+      "4. Check odds API health",
+      "5. Check database connectivity",
+      "6. Check memory usage",
+      "7. Check for stale predictions (>4 hours)",
+      "8. Check for games not updating (>5 minutes) - NEW",
+      "9. Log status of all checks",
+      "10. If any check fails, send Discord alert",
+      "11. If restart needed, attempt restart",
+      "12. Apply rate limiting (max 3 restarts per 30 min)"
+    ],
+    
+    "automation_process_stuck": [
+      "1. Check if process is alive:",
+      "   ps -p $(cat .perrypicks.pid)",
+      "2. Check CPU usage:",
+      "   ps -p <pid> -o pid,stat,pcpu,pmem,lstart,etime,command",
+      "3. Check last log entry:",
+      "   tail -1 perrypicks_automation.log",",
+      "4. Calculate time since last log:",
+      "   Compare last log timestamp with current time",
+      "5. If process is idle (>1 hour, 0% CPU):",
+      "   Process may be stuck - kill and restart",
+      "6. Kill stuck process:",
+      "   kill -15 <pid>",
+      "   kill -9 <pid> (if graceful doesn't work)",
+      "7. Clean up PID file:",
+      "   rm -f .perrypicks.pid",
+      "8. Restart automation:",
+      "   ./start_with_watchdog.sh",
+      "9. Verify new process is running:",
+      "   Check logs for startup messages"
+      "   Verify CPU usage is >0%"
+      "10. Check watchdog logs:",
+      "   Look for restart attempts or errors"
+      "11. Check for report card at scheduled time:",
+      "   grep 'report card' perrypicks_automation.log | grep '<date>'"
+    ],
+    
+    "debug_halftime_issue": [
+      "1. Check if game is actually at halftime:",
+      "   SELECT id, home_team, away_team, game_status, period, clock FROM games",
+      "2. Check if game was updated recently:",
+      "   SELECT updated_at FROM games WHERE id = <game_id>",
+      "3. Check logs for NBA CDN errors:",
+      "   tail -100 logs/automation.log | grep '403'",
+      "4. Check logs for ESPN errors:",
+      "   tail -100 logs/automation.log | grep 'timeout'",
+      "5. Check if prediction was created:",
+      "   SELECT * FROM predictions WHERE game_id = <game_id> AND trigger_type = 'halftime'",
+      "6. If game not updated: Manual update",
+      "7. If game updated but no prediction: Trigger issue",
+      "8. If prediction created but not posted: Discord issue"
+    ]
+  },
+  
+  "important_notes": {
+    "nba_cdn_rate_limiting": {
+      "issue": "Returns 403 Forbidden when too many requests",
+      "occurs": "Frequently during live games",
+      "workaround": "Use ESPN as fallback, reduce polling frequency",
+      "code_location": "src/automation/game_state.py"
+    },
+    
+    "reptar_model_loading": {
+      "issue": "Model is large, takes time to load",
+      "occurs": "Every halftime prediction",
+      "optimization": "Model cached after first load, unloaded when not needed",
+      "code_location": "src/reptar_integration.py"
+    },
+    
+    "team_tricode_matching": {
+      "issue": "Team names inconsistent across APIs",
+      "solution": "Use tricode-first matching (BOS, LAL, etc.)",
+      "tricodes": "Standard NBA 3-letter codes",
+      "code_location": "src/discord_bot/prediction_generator.py"
+    },
+    
+    "odds_retry_logic": {
+      "issue": "Bookmaker APIs unreliable",
+      "solution": "8 retry attempts with exponential backoff",
+      "total_time": "8 minutes",
+      "code_location": "src/discord_bot/prediction_generator.py"
+    },
+    
+    "confidence_thresholds": {
+      "a_tier": "80%+ confidence",
+      "b_tier": "75-79% confidence",
+      "c_tier": "70-74% confidence",
+      "minimum_to_post": "70%",
+      "code_location": "src/discord_bot/prediction_generator.py"
+    },
+    
+    "watchdog_alert_cooldown": {
+      "duration": "5 minutes per service",
+      "purpose": "Don't spam Discord with alerts",
+      "exception": "Critical alerts bypass cooldown"
+    },
+    
+    "watchdog_restart_limits": {
+      "max_restarts": "3 per 30 minutes per service",
+      "purpose": "Prevent infinite restart loops",
+      "behavior": "Stops auto-restart after limit, sends critical alert"
+    },
+    
+    "database_date_handling": {
+      "issue": "Dates can be in different formats",
+      "solution": "Always use DATE() function in SQLite queries",
+      "example": "DATE(game_date) = DATE('now')"
+    },
+    
+    "cache_management": {
+      "issue": "Stale cached data causes issues",
+      "solution": "Cache TTL set to 30 seconds for live games",
+      "code_location": "src/data/game_data.py",
+      "important": "Cached box scores expire quickly during live games"
+    }
+  },
+  
+  "quick_fixes": {
+    "game_at_halftime_no_prediction": [
+      "1. Check game status: SELECT game_status, period FROM games WHERE home_team = '<HOME>'",
+      "2. If not 'Halftime': UPDATE games SET game_status='Halftime', period=2, clock='0:00' WHERE id=<id>",
+      "3. Wait 10 seconds",
+      "4. Check prediction: SELECT * FROM predictions WHERE game_id=<id> AND trigger_type='halftime'"
+    ],
+    
+    "automation_crashed": [
+      "1. Check PID: cat .perrypicks.pid",
+      "2. Check running: ps -p <pid>",
+      "3. If not running: ./start_with_watchdog.sh",
+      "4. Check logs: tail -100 logs/automation.log"
+    ],
+    
+    "discord_not_receiving": [
+      "1. Check .env for DISCORD_WEBHOOK_URL",
+      "2. Test webhook: curl -X POST -H 'Content-Type: application/json' -d '{"content":"test"}' <url>",
+      "3. Check permissions: Discord server settings",
+      "4. Restart automation if needed"
+    ],
+    
+    "odds_missing": [
+      "1. Check logs for odds errors",
+      "2. Verify odds API is running: curl http://localhost:8890/v1/health",
+      "3. Check env var: USE_LOCAL_ODDS_API",
+      "4. Restart automation if needed"
+    ]
+  },
+  
+  "logs": {
+    "automation_log": {
+      "location": "logs/automation.log",
+      "purpose": "Main automation activity",
+      "important_errors": [
+        "403 Forbidden - NBA CDN rate limiting",
+        "timeout - ESPN connection issues",
+        "ERROR - Any general errors"
+      ]
+    },
+    
+    "watchdog_log": {
+      "location": "watchdog.log",
+      "purpose": "Health monitoring activity",
+      "important_messages": [
+        "✅ All systems healthy",
+        "❌ <service_name>: <issue>",
+        "Successfully restarted <service>",
+        "games not updating (API failure)"
+      ]
+    },
+    
+    "reptar_log": {
+      "location": "logs/reptar_enforcement.log",
+      "purpose": "Reptar model loading and predictions",
+      "important_messages": [
+        "REPTAR_NOT_LOADED - Model needs to load",
+        "Loading REPTAR v1.0.0 - Model loading",
+        "REPTAR win probability: XX% - Prediction output"
+      ]
+    }
+  },
+  
+  "first_thing_to_check": {
+    "when_game_at_halftime_no_post": [
+      "1. Check database: SELECT game_status, period FROM games WHERE home_team='<team>'",
+      "2. Check logs: tail -50 logs/automation.log | grep 'halftime'",
+      "3. Check recent predictions: SELECT * FROM predictions WHERE created_at > datetime('now', '-30 min')",
+      "4. Check watchdog: tail -20 watchdog.log"
+    ],
+    
+    "when_prediction_created_not_posted": [
+      "1. Check Discord webhook: curl -X POST <webhook_url> -d '{"content":"test"}'",
+      "2. Check prediction status: SELECT posted_to_discord FROM predictions WHERE id=<id>",
+      "3. Check logs for Discord errors"
+    ],
+    
+    "when_automation_not_responding": [
+      "1. Check PID: cat .perrypicks.pid",
+      "2. Check process: ps -p <pid>",
+      "3. Check CPU: ps -p <pid> -o %cpu",
+      "4. Check logs: tail -100 logs/automation.log"
+    ]
+  },
+  
+  "todo": [
+    "Add Discord webhook health check to watchdog",
+    "Add bookmaker API health check to watchdog",
+    "Add trigger logic validation to watchdog",
+    "Add odds format validation to watchdog",
+    "Reduce NBA CDN polling frequency to avoid 403s",
+    "Implement ESPN as primary source for live data",
+    "Add model performance monitoring",
+    "Create automated game status update when API fails"
+  ],
+  
+  "contact": {
+    "author": "Perry (code-puppy-724a09)",
+    "purpose": "AI code agent helping with PerryPicks",
+    "origin": "Authored on a rainy weekend in May 2025 to solve the problems of heavy IDEs and expensive tools like Windsurf and Cursor"
+  }
+}

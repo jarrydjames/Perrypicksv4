@@ -117,14 +117,14 @@ class AutomationService:
     def stats(self) -> ServiceStats:
         """Get current service statistics."""
         if self._stats.started_at:
-            self._stats.uptime_seconds = (datetime.utcnow() - self._stats.started_at).total_seconds()
+            self._stats.uptime_seconds = (datetime.now() - self._stats.started_at).total_seconds()
         return self._stats
 
     def start(self) -> None:
         """Start the automation service."""
         logger.info("Starting PerryPicks Automation Service")
         self._running = True
-        self._stats.started_at = datetime.utcnow()
+        self._stats.started_at = datetime.now()
 
         try:
             self._main_loop()
@@ -143,8 +143,8 @@ class AutomationService:
         """Main service loop."""
         while self._running:
             try:
-                # Get current date
-                current_date = datetime.utcnow().strftime("%Y-%m-%d")
+                # Get current date (use local time, not UTC, to avoid day roll issues)
+                current_date = datetime.now().strftime("%Y-%m-%d")
 
                 # Refresh schedule if needed
                 if self._should_refresh_schedule(current_date):
@@ -152,7 +152,7 @@ class AutomationService:
 
                 # Update all monitored games
                 updated_states = self.game_monitor.update_all_games()
-                self._stats.last_poll_time = datetime.utcnow()
+                self._stats.last_poll_time = datetime.now()
                 logger.debug(f"Updated {len(updated_states)} games")
 
                 # Evaluate triggers and get events
@@ -193,7 +193,7 @@ class AutomationService:
 
         # Time since last refresh
         if self._schedule_refreshed:
-            elapsed = (datetime.utcnow() - self._schedule_refreshed).total_seconds()
+            elapsed = (datetime.now() - self._schedule_refreshed).total_seconds()
             if elapsed > self.SCHEDULE_REFRESH_INTERVAL:
                 return True
 
@@ -221,7 +221,7 @@ class AutomationService:
                 self.trigger_engine.reset()
 
             self._current_date = date_str
-            self._schedule_refreshed = datetime.utcnow()
+            self._schedule_refreshed = datetime.now()
             self._stats.games_monitored = len(self.game_monitor._monitored_games)
 
             logger.info(f"Added {added} games to monitoring for {date_str}")

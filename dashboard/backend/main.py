@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 # Add project root to path
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from database import (
+from .database import (
     init_db,
     get_db,
     Game,
@@ -41,7 +41,7 @@ from database import (
     BetStatus,
     PredictionStatus,
 )
-from ghost_bettor import GhostBettor, get_ghost_bettor
+from .ghost_bettor import GhostBettor, get_ghost_bettor
 
 # Initialize FastAPI
 app = FastAPI(
@@ -227,13 +227,44 @@ def get_games(
 
 @app.get("/api/games/today", response_model=List[GameResponse])
 def get_todays_games(db: Session = Depends(get_db)):
-    """Get today's games."""
-    from datetime import date as date_type
+    """Get today's games.
+    
+    IMPORTANT: Games are stored in UTC but we query in local time.
+    We need to convert game_date from UTC to local time before comparing.
+    """
+    from datetime import date as date_type, datetime as dt
+    from sqlalchemy import func
+    
     today = date_type.today()
-    return db.query(Game).filter(
-        Game.game_date >= datetime(today.year, today.month, today.day),
-        Game.game_date < datetime(today.year, today.month, today.day) + timedelta(days=1)
-    ).order_by(Game.game_time).all()
+    
+    # Get games where game_date (UTC) converted to local time is today
+    # SQLite doesn't have timezone support, so we handle this differently:
+    # 1. Get all games from a wider date range (today ± 1 day)
+    # 2. Filter by checking if the local date matches today
+    
+    # Start date: yesterday at midnight UTC
+    start_date_utc = dt(today.year, today.month, today.day) - timedelta(days=1)
+    # End date: tomorrow at midnight UTC
+    end_date_utc = dt(today.year, today.month, today.day) + timedelta(days=2)
+    
+    # Get all games in this range
+    games = db.query(Game).filter(
+        Game.game_date >= start_date_utc,
+        Game.game_date < end_date_utc
+    ).all()
+    
+    # Filter to only games that are on the local date
+    # Convert UTC to local time and check date
+    games_today = []
+    for game in games:
+        if game.game_date:
+            # Convert UTC to local time (CST = UTC-6)
+            local_time = game.game_date - timedelta(hours=6)
+            local_date = local_time.date()
+            if local_date == today:
+                games_today.append(game)
+    
+    return games_today
 
 
 @app.get("/api/games/{game_id}", response_model=GameResponse)

@@ -23,13 +23,18 @@ Usage:
 """
 
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
+
 import requests
 import logging
 
 logger = logging.getLogger(__name__)
+# CST Timezone (UTC-6)
+CST = timezone(timedelta(hours=-6))
+
 
 # ============================================================================
 # TEAM ABBREVIATION NORMALIZATION
@@ -125,7 +130,7 @@ REQUEST_HEADERS = {
 }
 
 
-def fetch_espn_schedule(date_str: str, timeout: int = 10) -> Dict:
+def fetch_espn_schedule(date_str: str, timeout: int = 10, max_retries: int = 3) -> Dict:
     """
     Fetch game schedule from ESPN API.
 
@@ -139,18 +144,24 @@ def fetch_espn_schedule(date_str: str, timeout: int = 10) -> Dict:
     date_formatted = date_str.replace('-', '')
     url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={date_formatted}"
 
-    try:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
-        if response.status_code == 200:
-            logger.info(f"Fetched ESPN schedule for {date_str}")
-            return response.json()
-    except Exception as e:
-        logger.warning(f"Error fetching ESPN schedule: {e}")
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+            if response.status_code == 200:
+                logger.info(f"Fetched ESPN schedule for {date_str}")
+                return response.json()
+            last_err = RuntimeError(f"HTTP {response.status_code}")
+        except Exception as e:
+            last_err = e
+        sleep_s = min(0.8 * attempt, 3.0)
+        logger.warning(f"ESPN schedule fetch failed attempt {attempt}/{max_retries}: {last_err} -> sleep {sleep_s:.1f}s")
+        time.sleep(sleep_s)
 
     return {}
 
 
-def fetch_nba_cdn_schedule(timeout: int = 10) -> Dict:
+def fetch_nba_cdn_schedule(timeout: int = 10, max_retries: int = 3, cache_ttl_s: int = 6 * 3600) -> Dict:
     """
     Fetch full season schedule from NBA CDN (no rate limiting).
 
@@ -161,13 +172,37 @@ def fetch_nba_cdn_schedule(timeout: int = 10) -> Dict:
     """
     url = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 
-    try:
-        response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
-        if response.status_code == 200:
-            logger.info("Fetched NBA CDN full season schedule")
-            return response.json()
-    except Exception as e:
-        logger.warning(f"Error fetching NBA CDN schedule: {e}")
+    cache_dir = Path(".cache")
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / "nba_cdn_scheduleLeagueV2.json"
+
+    # Cache read
+    if cache_path.exists():
+        age_s = time.time() - cache_path.stat().st_mtime
+        if age_s < cache_ttl_s:
+            try:
+                return json.loads(cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+            if response.status_code == 200:
+                logger.info("Fetched NBA CDN full season schedule")
+                data = response.json()
+                try:
+                    cache_path.write_text(json.dumps(data), encoding="utf-8")
+                except Exception:
+                    pass
+                return data
+            last_err = RuntimeError(f"HTTP {response.status_code}")
+        except Exception as e:
+            last_err = e
+        sleep_s = min(0.8 * attempt, 3.0)
+        logger.warning(f"NBA CDN schedule fetch failed attempt {attempt}/{max_retries}: {last_err} -> sleep {sleep_s:.1f}s")
+        time.sleep(sleep_s)
 
     return {}
 
@@ -214,11 +249,23 @@ def extract_nba_games_for_date(nba_data: Dict, date_str: str) -> List[Dict]:
                 home_team = normalize_team_abbr(game.get('homeTeam', {}).get('teamTricode', ''))
                 game_time_utc = game.get('gameDateTimeUTC', game.get('gameDateUTC', ''))
 
+                # Convert UTC to CST
+                game_time_cst = None
+                if game_time_utc:
+                    try:
+                        # Parse UTC time (format: "2026-02-28T18:00:00Z")
+                        utc_dt = datetime.fromisoformat(game_time_utc.replace('Z', '+00:00'))
+                        # Convert to CST
+                        game_time_cst = utc_dt.astimezone(CST).replace(tzinfo=None)
+                    except Exception as e:
+                        logger.warning(f"Failed to parse game time: {game_time_utc}: {e}")
+
                 games.append({
                     'game_id': game_id,
                     'away_team': away_team,
                     'home_team': home_team,
-                    'game_time_utc': game_time_utc
+                    'game_time_utc': game_time_utc,
+                    'game_time_cst': game_time_cst
                 })
             break
 
@@ -330,7 +377,7 @@ def fetch_schedule(date_str: str) -> Dict:
     # Build games list
     games = []
 
-    if 'events' in espn_data:
+    if 'events' in espn_data and espn_data.get('events'):
         for game in espn_data['events']:
             espn_id = game.get('id')
             nba_id = mapping.get(espn_id)
@@ -351,14 +398,40 @@ def fetch_schedule(date_str: str) -> Dict:
             status = game.get('status', {}).get('type', {}).get('name', 'Unknown')
             date_time = game.get('date', '')
 
+            # Get CST time from NBA CDN data if available
+            game_time_cst = None
+            if nba_id:
+                for nba_game in nba_games:
+                    if nba_game.get('game_id') == nba_id:
+                        game_time_cst = nba_game.get('game_time_cst')
+                        break
+
             games.append({
                 'espn_id': espn_id,
                 'nba_id': nba_id,
                 'away_team': away_team,
                 'home_team': home_team,
                 'status': status,
-                'date_time': date_time
+                'date_time': date_time,
+                'game_time_cst': game_time_cst
             })
+
+    # Fallback: if ESPN returned no events, build games purely from NBA CDN
+    if not games and nba_games:
+        logger.warning(f"ESPN returned no events for {date_str}; falling back to NBA CDN schedule")
+        for ng in nba_games:
+            games.append(
+                {
+                    'espn_id': None,
+                    'nba_id': ng.get('game_id'),
+                    'away_team': ng.get('away_team', ''),
+                    'home_team': ng.get('home_team', ''),
+                    'status': 'Unknown',
+                    # Best-effort ISO UTC time if present
+                    'date_time': ng.get('game_time_utc'),
+                    'game_time_cst': ng.get('game_time_cst'),
+                }
+            )
 
     return {
         'date': date_str,

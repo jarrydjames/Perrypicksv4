@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""
+PerryPicks Health Watchdog
+
+Standalone health monitor that ensures all systems are running and fixes issues automatically.
+
+This process runs independently of the main automation and:
+- Monitors all critical components
+- Detects crashes and failures
+- Automatically restarts failed services
+- Alerts on critical issues
+- Prevents stuck states
+
+Usage:
+    python watchdog.py [--check-interval SECONDS] [--no-restart]
+
+    --check-interval: How often to check (default: 60 seconds)
+    --no-restart: Don't restart services, only alert (for debugging)
+"""
+
+import argparse
+import logging
+import os
+import psutil
+import requests
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] WATCHDOG: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("Watchdog")
+
+# Constants
+PID_FILE = Path(".perrypicks.pid")
+WATCHDOG_PID_FILE = Path(".watchdog.pid")
+AUTOMATION_SCRIPT = Path("start.py")
+
+# Ports to monitor
+PORTS = {
+    "backend": 8000,
+    "odds_api": 8890,
+}
+
+# Health endpoints
+HEALTH_ENDPOINTS = {
+    "backend": "http://localhost:8000/api/health",
+    "odds_api": "http://localhost:8890/v1/health",
+}
+
+
+class ServiceStatus:
+    """Status of a monitored service."""
+    def __init__(self, name: str, running: bool, message: str, details: Dict = None):
+        self.name = name
+        self.running = running
+        self.message = message
+        self.details = details or {}
+        self.last_check = datetime.now()
+
+
+class Watchdog:
+    """
+    Standalone health watchdog for PerryPicks.
+
+    Monitors:
+    - Main automation process
+    - Backend API server
+    - Odds API server
+    - Database connectivity
+    - Memory/CPU usage
+    - Stuck states (triggers, date rollover)
+    """
+
+    def __init__(self, check_interval: int = 60, auto_restart: bool = True):
+        self.check_interval = check_interval
+        self.auto_restart = auto_restart
+        self._running = False
+        self._start_time = datetime.now()
+        self._service_history: Dict[str, List[ServiceStatus]] = {}
+        self._restart_counts: Dict[str, int] = {}
+        self._last_alert_time: Dict[str, datetime] = {}
+        self._alert_cooldown = timedelta(minutes=5)  # Don't spam alerts
+        self._max_restarts = 3  # Max restarts before stopping
+        self._restart_window = timedelta(minutes=30)  # Restart window
+        self._restart_history: List[datetime] = []
+
+    def start(self):
+        """Start the watchdog."""
+        logger.info("="*60)
+        logger.info("PerryPicks Watchdog Starting")
+        logger.info("="*60)
+        logger.info(f"Check interval: {self.check_interval}s")
+        logger.info(f"Auto-restart: {'Enabled' if self.auto_restart else 'Disabled'}")
+        logger.info(f"Max restarts: {self._max_restarts} per {self._restart_window}")
+        logger.info("")
+
+        # Create PID file
+        self._create_pid_file()
+
+        # Setup signal handlers
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+
+        self._running = True
+        logger.info("Watchdog started and monitoring...")
+        logger.info("")
+
+        # Main loop
+        while self._running:
+            try:
+                self._check_cycle()
+                time.sleep(self.check_interval)
+            except Exception as e:
+                logger.error(f"Error in check cycle: {e}")
+                time.sleep(10)  # Wait before retrying
+
+    def stop(self):
+        """Stop the watchdog."""
+        logger.info("Stopping watchdog...")
+        self._running = False
+        self._cleanup_pid_file()
+        logger.info("Watchdog stopped")
+
+    def _create_pid_file(self):
+        """Create PID file for this watchdog process."""
+        WATCHDOG_PID_FILE.write_text(str(os.getpid()))
+        logger.info(f"Watchdog PID file created: {WATCHDOG_PID_FILE}")
+
+    def _cleanup_pid_file(self):
+        """Remove PID file."""
+        if WATCHDOG_PID_FILE.exists():
+            WATCHDOG_PID_FILE.unlink()
+
+    def _handle_shutdown(self, signum, frame):
+        """Handle shutdown signals."""
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.stop()
+        sys.exit(0)
+
+    def _check_cycle(self):
+        """Run a complete health check cycle."""
+        logger.info("-" * 40)
+        logger.info(f"Health Check Cycle - {datetime.now().strftime('%H:%M:%S')}")
+
+        # Check all services
+        services = []
+        services.append(self._check_automation())
+        services.append(self._check_backend())
+        services.append(self._check_odds_api())
+        services.append(self._check_database())
+        services.append(self._check_memory())
+        services.append(self._check_stuck_states())
+
+        # Log status
+        self._log_status(services)
+
+        # Handle failures
+        self._handle_failures(services)
+
+        # Store history
+        for service in services:
+            if service.name not in self._service_history:
+                self._service_history[service.name] = []
+            self._service_history[service.name].append(service)
+            # Keep only last 10 checks
+            if len(self._service_history[service.name]) > 10:
+                self._service_history[service.name] = self._service_history[service.name][-10:]
+
+    def _check_automation(self) -> ServiceStatus:
+        """Check if main automation is running."""
+        try:
+            # Check PID file
+            if not PID_FILE.exists():
+                return ServiceStatus(
+                    "Automation",
+                    running=False,
+                    message="No PID file found",
+                )
+
+            # Check if process is running
+            pid = int(PID_FILE.read_text().strip())
+            if not self._is_process_running(pid):
+                return ServiceStatus(
+                    "Automation",
+                    running=False,
+                    message=f"Process {pid} not running",
+                    details={"pid": pid},
+                )
+
+            # Check if process is responsive
+            process = psutil.Process(pid)
+            cpu_percent = process.cpu_percent(interval=1)
+            memory_mb = process.memory_info().rss / 1024 / 1024
+
+
+            return ServiceStatus(
+                "Automation",
+                running=True,
+                message="Running",
+                details={
+                    "pid": pid,
+                    "cpu_percent": cpu_percent,
+                    "memory_mb": memory_mb,
+                },
+            )
+
+        except Exception as e:
+            return ServiceStatus(
+                "Automation",
+                running=False,
+                message=f"Check failed: {e}",
+            )
+
+    def _check_backend(self) -> ServiceStatus:
+        """Check if backend API is running."""
+        try:
+            url = HEALTH_ENDPOINTS["backend"]
+            start = time.time()
+            response = requests.get(url, timeout=5)
+            latency_ms = (time.time() - start) * 1000
+
+            if response.status_code == 200:
+                return ServiceStatus(
+                    "Backend API",
+                    running=True,
+                    message="Healthy",
+                    details={"latency_ms": round(latency_ms, 1)},
+                )
+            else:
+                return ServiceStatus(
+                    "Backend API",
+                    running=False,
+                    message=f"HTTP {response.status_code}",
+                    details={"status_code": response.status_code},
+                )
+        except requests.exceptions.RequestException as e:
+            return ServiceStatus(
+                "Backend API",
+                running=False,
+                message=f"Not responding: {e}",
+            )
+        except Exception as e:
+            return ServiceStatus(
+                "Backend API",
+                running=False,
+                message=f"Check failed: {e}",
+            )
+
+    def _check_odds_api(self) -> ServiceStatus:
+        """Check if Odds API is running."""
+        try:
+            url = HEALTH_ENDPOINTS["odds_api"]
+            start = time.time()
+            response = requests.get(url, timeout=5)
+            latency_ms = (time.time() - start) * 1000
+
+            if response.status_code == 200:
+                return ServiceStatus(
+                    "Odds API",
+                    running=True,
+                    message="Healthy",
+                    details={"latency_ms": round(latency_ms, 1)},
+                )
+            else:
+                return ServiceStatus(
+                    "Odds API",
+                    running=False,
+                    message=f"HTTP {response.status_code}",
+                    details={"status_code": response.status_code},
+                )
+        except requests.exceptions.RequestException as e:
+            # Check if local odds API is disabled
+            if os.environ.get("USE_LOCAL_ODDS_API", "").lower() != "true":
+                return ServiceStatus(
+                    "Odds API",
+                    running=True,
+                    message="Not configured (using external API)",
+                )
+            return ServiceStatus(
+                "Odds API",
+                running=False,
+                message=f"Not responding: {e}",
+            )
+        except Exception as e:
+            return ServiceStatus(
+                "Odds API",
+                running=False,
+                message=f"Check failed: {e}",
+            )
+
+    def _check_database(self) -> ServiceStatus:
+        """Check database connectivity."""
+        try:
+            sys.path.insert(0, str(Path.cwd()))
+            from dashboard.backend.database import SessionLocal
+            from sqlalchemy import text
+
+            db = SessionLocal()
+            try:
+                result = db.execute(text("SELECT 1")).fetchone()
+                if result and result[0] == 1:
+                    return ServiceStatus(
+                        "Database",
+                        running=True,
+                        message="Connected",
+                    )
+                else:
+                    return ServiceStatus(
+                        "Database",
+                        running=False,
+                        message="Query failed",
+                    )
+            finally:
+                db.close()
+        except Exception as e:
+            return ServiceStatus(
+                "Database",
+                running=False,
+                message=f"Connection failed: {e}",
+            )
+
+    def _check_memory(self) -> ServiceStatus:
+        """Check system memory usage."""
+        try:
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
+            memory_gb = memory.total / (1024**3)
+            available_gb = memory.available / (1024**3)
+
+            if memory_percent < 80:
+                status = "Normal"
+                running = True
+            elif memory_percent < 90:
+                status = "High"
+                running = True
+            else:
+                status = "Critical"
+                running = False
+            return ServiceStatus(
+                "Memory",
+                running=running,
+                message=f"{status} ({memory_percent:.1f}%)",
+                details={
+                    "memory_percent": memory_percent,
+                    "memory_gb": round(memory_gb, 2),
+                    "available_gb": round(available_gb, 2),
+                },
+            )
+        except Exception as e:
+            return ServiceStatus(
+                "Memory",
+                running=False,
+                message=f"Check failed: {e}",
+            )
+
+    def _check_stuck_states(self) -> ServiceStatus:
+        """Check for stuck states (triggers, date rollover, API failures)."""
+        try:
+            sys.path.insert(0, str(Path.cwd()))
+            from dashboard.backend.database import SessionLocal, Prediction
+            from datetime import date
+            from sqlalchemy import text
+
+            db = SessionLocal()
+            issues = []
+            details = {}
+
+            try:
+                # Check for stale predictions (created > 4 hours ago, not posted)
+                four_hours_ago = datetime.now() - timedelta(hours=4)
+                stale_predictions = db.query(Prediction).filter(
+                    Prediction.created_at < four_hours_ago,
+                    Prediction.posted_to_discord == False,
+                    Prediction.status.in_(['PENDING', 'FAILED'])
+                ).count()
+
+                if stale_predictions > 0:
+                    issues.append(f"{stale_predictions} stale predictions")
+                    details["stale_predictions"] = stale_predictions
+                
+                # NEW: Check for API failure - games not updating
+                # Detects if game statuses aren't being updated (API 403/timeout)
+                five_min_ago = datetime.now() - timedelta(minutes=5)
+                result = db.execute(text("""
+                    SELECT COUNT(*) FROM games
+                    WHERE DATE(game_date) = :today
+                      AND (updated_at IS NULL OR updated_at < :cutoff)
+                      AND game_status NOT IN ('Final', 'Scheduled')
+                """), {
+                    "today": date.today().strftime("%Y-%m-%d"),
+                    "cutoff": five_min_ago
+                }).fetchone()
+                
+                stale_games = result[0] if result else 0
+                if stale_games > 0:
+                    issues.append(f"{stale_games} games not updating (API failure)")
+                    details["stale_games"] = stale_games
+                
+                # Check for games stuck in wrong date
+                # Only check today's games (not tomorrow's or historical games)
+                today = date.today()
+                today_str = today.strftime("%Y-%m-%d")
+                
+                result = db.execute(text("""
+                    SELECT COUNT(*) FROM games
+                    WHERE DATE(game_date) = :today
+                      AND DATE(game_date) != :check_date
+                """), {
+                    "today": today_str,
+                    "check_date": today_str
+                }).fetchone()
+
+                wrong_date_games = result[0] if result else 0
+                if wrong_date_games > 0:
+                    issues.append(f"{wrong_date_games} games wrong date")
+                    details["wrong_date_games"] = wrong_date_games
+
+            finally:
+                db.close()
+
+            if issues:
+                return ServiceStatus(
+                    "Stuck States",
+                    running=False,
+                    message=", ".join(issues),
+                    details=details,
+                )
+            else:
+                return ServiceStatus(
+                    "Stuck States",
+                    running=True,
+                    message="No issues",
+                )
+
+        except Exception as e:
+            return ServiceStatus(
+                "Stuck States",
+                running=False,
+                message=f"Check failed: {e}",
+            )
+
+    def _log_status(self, services: List[ServiceStatus]):
+        """Log status of all services."""
+        all_healthy = all(s.running for s in services)
+
+        for service in services:
+            if service.running:
+                logger.info(f"✅ {service.name}: {service.message}")
+                if service.details:
+                    logger.debug(f"   Details: {service.details}")
+            else:
+                logger.warning(f"❌ {service.name}: {service.message}")
+                if service.details:
+                    logger.warning(f"   Details: {service.details}")
+
+        if all_healthy:
+            logger.info("All systems healthy ✓")
+        else:
+            logger.warning("Some systems unhealthy - attempting fixes...")
+
+    def _handle_failures(self, services: List[ServiceStatus]):
+        """Handle failed services - restart if auto-restart enabled."""
+        if not self.auto_restart:
+            return
+
+        for service in services:
+            if not service.running:
+                self._restart_service(service)
+
+    def _restart_service(self, service: ServiceStatus):
+        """Restart a failed service."""
+        service_name = service.name
+
+        # Check if we've restarted too many times recently
+        if not self._can_restart(service_name):
+            self._send_alert(
+                f"🚨 **CRITICAL**: {service_name} failed too many times. Stopping auto-restart for this service.",
+                service_name,
+            )
+            return
+
+        # Check alert cooldown
+        if self._is_alert_cooldown_active(service_name):
+            logger.info(f"Alert cooldown active for {service_name}, skipping notification")
+        else:
+            self._send_alert(
+                f"⚠️ **Service Down**: {service_name}\n\nMessage: {service.message}\n\nAttempting restart...",
+                service_name,
+            )
+
+        # Attempt restart based on service type
+        success = False
+        if service_name == "Automation":
+            success = self._restart_automation()
+        elif service_name == "Backend API":
+            success = self._restart_backend()
+        elif service_name == "Odds API":
+            success = self._restart_odds_api()
+        elif service_name == "Stuck States":
+            success = self._fix_stuck_states(service)
+
+        if success:
+            logger.info(f"✅ Successfully restarted/fixed {service_name}")
+            self._record_restart(service_name)
+        else:
+            logger.error(f"❌ Failed to restart {service_name}")
+            self._send_alert(
+                f"🚨 **CRITICAL**: Failed to restart {service_name}. Manual intervention required!",
+                service_name,
+                force=True,  # Send alert even if on cooldown
+            )
+
+    def _can_restart(self, service_name: str) -> bool:
+        """Check if we can restart a service (not too many recent restarts)."""
+        now = datetime.now()
+        # Clean old restart history
+        self._restart_history = [
+            t for t in self._restart_history if now - t < self._restart_window
+        ]
+        # Check if we're under the limit
+        return len(self._restart_history) < self._max_restarts
+
+    def _is_alert_cooldown_active(self, service_name: str) -> bool:
+        """Check if alert cooldown is active for a service."""
+        if service_name not in self._last_alert_time:
+            return False
+        return datetime.now() - self._last_alert_time[service_name] < self._alert_cooldown
+
+    def _record_restart(self, service_name: str):
+        """Record a restart for rate limiting."""
+        self._restart_history.append(datetime.now())
+        self._restart_counts[service_name] = self._restart_counts.get(service_name, 0) + 1
+        logger.info(f"Restart count for {service_name}: {self._restart_counts[service_name]}")
+
+    def _restart_automation(self) -> bool:
+        """Restart the main automation process."""
+        try:
+            # Kill existing process if running
+            if PID_FILE.exists():
+                pid = int(PID_FILE.read_text().strip())
+                if self._is_process_running(pid):
+                    logger.info(f"Killing existing automation process (PID {pid})...")
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(5)
+                    # Force kill if still running
+                    if self._is_process_running(pid):
+                        logger.info(f"Force killing automation process (PID {pid})...")
+                        os.kill(pid, signal.SIGKILL)
+                        time.sleep(2)
+
+            # Start new process
+            logger.info("Starting new automation process...")
+            subprocess.Popen(
+                [sys.executable, str(AUTOMATION_SCRIPT)],
+                cwd=str(Path.cwd()),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+            )
+            time.sleep(10)  # Give it time to start
+
+            # Verify it's running
+            if PID_FILE.exists():
+                pid = int(PID_FILE.read_text().strip())
+                if self._is_process_running(pid):
+                    logger.info(f"Automation started successfully (PID {pid})")
+                    return True
+
+            logger.error("Automation failed to start")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to restart automation: {e}")
+            return False
+
+    def _restart_backend(self) -> bool:
+        """Restart the backend API."""
+        try:
+            # Find and kill backend process
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if proc.info['cmdline'] and any(
+                    'uvicorn' in cmd or 'main:app' in cmd
+                    for cmd in proc.info['cmdline']
+                ):
+                    logger.info(f"Killing backend process (PID {proc.info['pid']})...")
+                    os.kill(proc.info['pid'], signal.SIGTERM)
+                    time.sleep(2)
+
+            # Start backend (will be started by automation)
+            logger.info("Backend will be restarted by automation")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restart backend: {e}")
+            return False
+
+    def _restart_odds_api(self) -> bool:
+        """Restart the Odds API."""
+        try:
+            # Find and kill Odds API process
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if proc.info['cmdline'] and any(
+                    'odds_api' in cmd or '8890' in cmd
+                    for cmd in proc.info['cmdline']
+                ):
+                    logger.info(f"Killing Odds API process (PID {proc.info['pid']})...")
+                    os.kill(proc.info['pid'], signal.SIGTERM)
+                    time.sleep(2)
+
+            # Start Odds API (will be started by automation)
+            logger.info("Odds API will be restarted by automation")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to restart Odds API: {e}")
+            return False
+
+    def _fix_stuck_states(self, service: ServiceStatus) -> bool:
+        """Fix stuck states."""
+        try:
+            sys.path.insert(0, str(Path.cwd()))
+            from dashboard.backend.database import SessionLocal, Prediction
+            from datetime import date
+            from sqlalchemy import text
+            import pandas as pd
+
+            db = SessionLocal()
+            fixed = 0
+            issues_fixed = []
+
+            try:
+                # Fix stale predictions - mark them as failed
+                four_hours_ago = datetime.now() - timedelta(hours=4)
+                stale = db.query(Prediction).filter(
+                    Prediction.created_at < four_hours_ago,
+                    Prediction.posted_to_discord == False,
+                    Prediction.status.in_(['PENDING', 'FAILED'])
+                ).all()
+
+                for pred in stale:
+                    pred.status = 'FAILED'
+                    fixed += 1
+                db.commit()
+                if stale:
+                    issues_fixed.append(f"Marked {len(stale)} stale predictions as FAILED")
+
+                # Fix games wrong date - queue today's games
+                # Only check games from today (not historical or future games)
+                wrong_date = db.execute(text("""
+                    SELECT COUNT(*) FROM games
+                    WHERE DATE(game_date) = :today
+                      AND game_status NOT IN ('Final', 'Scheduled')
+                      AND updated_at < datetime('now', '-30 minutes')
+                """), {"today": date.today().strftime("%Y-%m-%d")}).fetchone()[0]
+
+                if wrong_date > 0:
+                    # Trigger game re-queue by touching the schedule
+                    from src.schedule import fetch_schedule
+                    today = date.today().strftime("%Y-%m-%d")
+                    schedule = fetch_schedule(today)
+                    issues_fixed.append(f"Refreshed schedule for {len(schedule.get('games', []))} games")
+
+            finally:
+                db.close()
+
+            if issues_fixed:
+                logger.info(f"Fixed stuck states: {', '.join(issues_fixed)}")
+                return True
+            else:
+                logger.warning("No stuck states to fix")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to fix stuck states: {e}")
+            return False
+
+    def _is_process_running(self, pid: int) -> bool:
+        """Check if a process with given PID is running."""
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return False
+
+    def _send_alert(self, message: str, service_name: str, force: bool = False):
+        """Send alert via Discord webhook."""
+        try:
+            webhook_url = os.environ.get("DISCORD_ALERTS_WEBHOOK")
+            if not webhook_url:
+                webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+
+            if not webhook_url:
+                logger.warning("No Discord webhook configured for alerts")
+                return
+
+            # Check cooldown
+            if not force and self._is_alert_cooldown_active(service_name):
+                return
+
+            # Send alert
+            response = requests.post(
+                webhook_url,
+                json={
+                    "content": f"**WATCHDOG ALERT**\n\n{message}\n\n_Time: {datetime.now().strftime('%H:%M:%S')}_",
+                },
+                timeout=10,
+            )
+
+            if response.status_code == 204:
+                self._last_alert_time[service_name] = datetime.now()
+                logger.info(f"Alert sent for {service_name}")
+            else:
+                logger.warning(f"Failed to send alert: HTTP {response.status_code}")
+
+        except Exception as e:
+            logger.error(f"Failed to send alert: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PerryPicks Health Watchdog")
+    parser.add_argument(
+        "--check-interval",
+        type=int,
+        default=60,
+        help="How often to check (seconds, default: 60)",
+    )
+    parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Don't restart services, only alert (for debugging)",
+    )
+    args = parser.parse_args()
+
+    # Check if already running
+    if WATCHDOG_PID_FILE.exists():
+        pid = int(WATCHDOG_PID_FILE.read_text().strip())
+        if psutil.pid_exists(pid):
+            logger.error(f"Watchdog already running (PID {pid})")
+            logger.error("Run: kill -15 {pid} to stop existing watchdog")
+            sys.exit(1)
+        else:
+            logger.warning("Removing stale watchdog PID file")
+            WATCHDOG_PID_FILE.unlink()
+
+    # Start watchdog
+    watchdog = Watchdog(
+        check_interval=args.check_interval,
+        auto_restart=not args.no_restart,
+    )
+    watchdog.start()
+
+if __name__ == "__main__":
+    main()

@@ -93,6 +93,8 @@ class DiscordClient:
         content: str,
         embeds: Optional[List[Dict]] = None,
         username: Optional[str] = None,
+        *,
+        wait: bool = False,
     ) -> DiscordPostResult:
         """
         Post a message to Discord.
@@ -118,7 +120,9 @@ class DiscordClient:
         if embeds:
             payload["embeds"] = embeds
 
-        return self._post_with_retry(payload)
+        url = self.webhook_url + ("?wait=true" if wait else "")
+
+        return self._request_with_retry(method="POST", url=url, payload=payload)
 
     def post_embed(
         self,
@@ -154,6 +158,36 @@ class DiscordClient:
             embed["footer"] = {"text": footer}
 
         return self.post_message("", embeds=[embed])
+
+
+    def edit_message(
+        self,
+        *,
+        message_id: str,
+        content: str,
+        embeds: Optional[List[Dict]] = None,
+    ) -> DiscordPostResult:
+        """Edit a previously posted webhook message.
+
+        NOTE: Discord only allows editing messages created by the same webhook.
+        """
+
+        if not message_id:
+            return DiscordPostResult(success=False, error="missing message_id")
+
+        # Webhook edit endpoint
+        url = f"{self.webhook_url}/messages/{message_id}"
+
+        # Truncate content if needed
+        if len(content) > self.MAX_CONTENT_LENGTH:
+            content = content[: self.MAX_CONTENT_LENGTH - 3] + "..."
+            logger.warning("Message truncated to Discord limit")
+
+        payload: Dict = {"content": content}
+        if embeds is not None:
+            payload["embeds"] = embeds
+
+        return self._request_with_retry(method="PATCH", url=url, payload=payload)
 
     def post_halftime_prediction(
         self,
@@ -318,9 +352,9 @@ class DiscordClient:
             fields=fields,
         )
 
-    def _post_with_retry(self, payload: Dict) -> DiscordPostResult:
+    def _request_with_retry(self, *, method: str, url: str, payload: Dict) -> DiscordPostResult:
         """
-        Post to Discord with exponential backoff retry.
+        Send a Discord webhook request with exponential backoff retry.
 
         Args:
             payload: JSON payload to send
@@ -332,11 +366,11 @@ class DiscordClient:
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                response = self._session.post(self.webhook_url, json=payload, timeout=30)
+                response = self._session.request(method.upper(), url, json=payload, timeout=30)
 
                 if response.status_code == 204:
                     # Success (no content)
-                    logger.info("Discord post successful")
+                    logger.info("Discord request successful")
                     return DiscordPostResult(success=True, retry_count=attempt)
 
                 if response.status_code == 200:
@@ -344,7 +378,7 @@ class DiscordClient:
                     try:
                         data = response.json()
                         message_id = data.get("id")
-                        logger.info(f"Discord post successful: {message_id}")
+                        logger.info(f"Discord request successful: {message_id}")
                         return DiscordPostResult(
                             success=True, message_id=message_id, retry_count=attempt
                         )

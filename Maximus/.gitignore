@@ -1,0 +1,6 @@
+# Maximus artifacts
+artifacts/
+reports/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

@@ -1,0 +1,22 @@
+{
+  "project": "Reptar",
+  "created_at": "2026-03-01T01:55:49.332144+00:00",
+  "models": {
+    "catboost_h2_total": {
+      "path": "/Users/jarrydhawley/Desktop/Predictor/PerryPicks_v5/Reptar/models/catboost_h2_total.joblib",
+      "sha256": "bc148ba608f468b95061b60a9c712b84136bc3c179319ce70c696f868c63adef",
+      "bytes": 858059
+    },
+    "catboost_h2_margin": {
+      "path": "/Users/jarrydhawley/Desktop/Predictor/PerryPicks_v5/Reptar/models/catboost_h2_margin.joblib",
+      "sha256": "0124bb43929f4393242cfa7c3738e3e649a1a7a281d102a6d393a7087a1434be",
+      "bytes": 858315
+    }
+  },
+  "feature_schema": {
+    "path": "/Users/jarrydhawley/Desktop/Predictor/PerryPicks_v5/Reptar/artifacts/FEATURE_SCHEMA.json",
+    "sha256": "9c933df4077fda27db8ed7e8c7f0467860a9dc3099e6b03c234975a9cf19d221",
+    "bytes": 808,
+    "n_features": 38
+  }
+}

@@ -17,8 +17,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Set
-
 from src.data.game_data import fetch_box, get_game_info
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +101,14 @@ class GameStateMonitor:
     """
 
     # Polling interval in seconds
-    DEFAULT_POLL_INTERVAL = 30
-
+    DEFAULT_POLL_INTERVAL = 45  # Increased to reduce NBA CDN requests and prevent rate limiting
+    
     def __init__(self, poll_interval: int = None):
         self.poll_interval = poll_interval or self.DEFAULT_POLL_INTERVAL
         self._games: Dict[str, GameState] = {}
         self._last_poll: Dict[str, float] = {}
         self._monitored_games: Set[str] = set()
+        self._espn_game_cache: Dict[str, dict] = {}  # Cache ESPN game data
 
     def add_game(self, game_id: str) -> None:
         """Add a game to monitor."""
@@ -130,9 +131,114 @@ class GameStateMonitor:
         """Get all tracked game states."""
         return self._games.copy()
 
+    def _fetch_espn_status(self, game_id: str) -> Optional[dict]:
+        """
+        Fetch game status from ESPN API (fallback for NBA CDN rate limits).
+        
+        ESPN API is more lenient with rate limits and provides:
+        - Game status (scheduled, live, halftime, final)
+        - Current period and time remaining
+        - Scores
+        """
+        try:
+            # Fetch today's scoreboard from ESPN
+            from datetime import datetime
+            today = datetime.now().strftime("%Y%m%d")
+            url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={today}"
+            
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            events = data.get("events", [])
+            
+            for event in events:
+                event_id = event.get("id")
+                
+                # Match by game ID (ESPN uses different ID format, need to match by teams)
+                if event_id == game_id:
+                    return event
+                
+                # Also try to match by looking up in database to find ESPN event ID
+                # For now, cache all events and return the one that matches our game
+                self._espn_game_cache[event_id] = event
+            
+            # If we cached all events, try to find a match
+            # This is a temporary fix - ideally we'd have a mapping
+            if self._espn_game_cache:
+                return self._espn_game_cache.get(game_id)
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"ESPN API fetch failed for {game_id}: {e}")
+            return None
+    
+    def _parse_espn_status(self, game_id: str, espn_data: dict) -> Optional[GameState]:
+        """
+        Parse ESPN API response into GameState object.
+        
+        ESPN provides game status without requiring box score data.
+        """
+        try:
+            status = espn_data.get("status", {})
+            status_type = status.get("type", {})
+            status_desc = status_type.get("description", "")
+            
+            competitions = espn_data.get("competitions", [])
+            if not competitions:
+                return None
+            
+            comp = competitions[0]
+            home_team = comp["competitors"][0]
+            away_team = comp["competitors"][1]
+            
+            # Get scores
+            home_score = home_team.get("score", 0) or 0
+            away_score = away_team.get("score", 0) or 0
+            
+            # Get period and time
+            period = status.get("period", 0) or 0
+            time_remaining = status.get("displayClock", "12:00") or "12:00"
+            
+            # Determine status
+            if status_desc == "Final":
+                game_status = "final"
+            elif "halftime" in status_desc.lower():
+                game_status = "halftime"
+            elif period > 0:
+                game_status = "live"
+            else:
+                game_status = "scheduled"
+            
+            # Get team info
+            home_tricode = home_team.get("team", {}).get("abbreviation", "")
+            away_tricode = away_team.get("team", {}).get("abbreviation", "")
+            home_name = home_team.get("team", {}).get("displayName", "")
+            away_name = away_team.get("team", {}).get("displayName", "")
+            
+            return GameState(
+                game_id=game_id,
+                status=game_status,
+                period=period,
+                time_remaining=time_remaining,
+                home_score=int(home_score),
+                away_score=int(away_score),
+                home_team=home_name,
+                away_team=away_name,
+                home_tricode=home_tricode,
+                away_tricode=away_tricode,
+                game_time_utc="",
+                last_updated=datetime.now(),
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to parse ESPN status for {game_id}: {e}")
+            return None
+
     def update_game(self, game_id: str) -> Optional[GameState]:
         """
         Update state for a single game.
+        
+        Tries NBA CDN first, falls back to ESPN API on 403 errors.
 
         Returns:
             Updated GameState or None if fetch failed
@@ -144,8 +250,26 @@ class GameStateMonitor:
             self._last_poll[game_id] = time.time()
             return state
         except Exception as e:
-            logger.error(f"Failed to update game {game_id}: {e}")
-            return None
+            error_str = str(e).lower()
+            
+            # Check if it's a 403 rate limit error
+            if '403' in error_str or 'forbidden' in error_str:
+                logger.warning(f"NBA CDN rate limited for {game_id}, falling back to ESPN API")
+                
+                # Try ESPN API as fallback
+                espn_data = self._fetch_espn_status(game_id)
+                if espn_data:
+                    state = self._parse_espn_status(game_id, espn_data)
+                    if state:
+                        self._games[game_id] = state
+                        self._last_poll[game_id] = time.time()
+                        return state
+                
+                logger.error(f"Both NBA CDN and ESPN API failed for {game_id}")
+                return None
+            else:
+                logger.error(f"Failed to update game {game_id}: {e}")
+                return None
 
     def update_all_games(self) -> List[GameState]:
         """
@@ -226,10 +350,15 @@ class GameStateMonitor:
         """Detect if game is at halftime."""
         # Halftime conditions:
         # 1. Period is 2 (end of Q2)
-        # 2. Time remaining is 00:00
+        # 2. Time remaining is 00:00 or 0.0 (various formats)
         # 3. Both teams have completed 2 periods
 
-        time_remaining_zero = time_remaining == "00:00" or time_remaining == "0:00"
+        # Handle multiple clock formats: "00:00", "0:00", "0.0"
+        time_remaining_zero = (
+            time_remaining == "00:00" or 
+            time_remaining == "0:00" or 
+            time_remaining == "0.0"
+        )
 
         if not time_remaining_zero:
             return False

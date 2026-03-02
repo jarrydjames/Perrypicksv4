@@ -62,7 +62,8 @@
       "Bash(# Check for any logs from yesterday''s predictions find /Users/jarrydhawley/Desktop/Predictor/PerryPicks_v4 -name \"\"*.log\"\" -mtime -2 ls -la /tmp/*.log)",
       "Bash(head:*)",
       "Bash(# Check the Odds API logs tail -100 /tmp/odds_api.log || echo \"\"No Odds API log found\"\" # Check if Odds API is running ps aux)",
-      "Bash(# Check for any update scripts ls -la /Users/jarrydhawley/Desktop/Predictor/PerryPicks_v4/scripts/ || echo \"\"No scripts directory\"\" find /Users/jarrydhawley/Desktop/Predictor/PerryPicks_v4 -name \"\"*update*\"\" -o -name \"\"*refresh*\"\" -o -name \"\"*ingest*\"\")"
+      "Bash(# Check for any update scripts ls -la /Users/jarrydhawley/Desktop/Predictor/PerryPicks_v4/scripts/ || echo \"\"No scripts directory\"\" find /Users/jarrydhawley/Desktop/Predictor/PerryPicks_v4 -name \"\"*update*\"\" -o -name \"\"*refresh*\"\" -o -name \"\"*ingest*\"\")",
+      "Bash(# Find and kill the existing Odds API process pkill -f \"\"uvicorn app.main:app.*8890\"\" || true sleep 2 # Restart it cd ../Odds_Api && \\\\ source .venv/bin/activate && \\\\ ODDS_PROVIDER=composite PORT=8890 nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8890 2>&1 & echo \"\"Waiting for Odds API to start...\"\" sleep 5 # Check health curl -s \"\"http://localhost:8890/v1/health\"\")"
     ]
   }
 }

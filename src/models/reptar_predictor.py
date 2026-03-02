@@ -35,9 +35,24 @@ logger = logging.getLogger(__name__)
 
 # Model paths - use absolute path based on project root
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-MODEL_DIR = PROJECT_ROOT / "models_v3" / "halftime"
-TOTAL_MODEL_PATH = MODEL_DIR / "catboost_h2_total.joblib"
-MARGIN_MODEL_PATH = MODEL_DIR / "catboost_h2_margin.joblib"
+
+# Prefer standalone folder (same pattern as Maximus/)
+REPTAR_DIR = PROJECT_ROOT / "Reptar"
+REPTAR_MODELS_DIR = REPTAR_DIR / "models"
+
+# Back-compat fallback (legacy location)
+LEGACY_MODEL_DIR = PROJECT_ROOT / "models_v3" / "halftime"
+
+TOTAL_MODEL_PATH = (
+    (REPTAR_MODELS_DIR / "catboost_h2_total.joblib")
+    if (REPTAR_MODELS_DIR / "catboost_h2_total.joblib").exists()
+    else (LEGACY_MODEL_DIR / "catboost_h2_total.joblib")
+)
+MARGIN_MODEL_PATH = (
+    (REPTAR_MODELS_DIR / "catboost_h2_margin.joblib")
+    if (REPTAR_MODELS_DIR / "catboost_h2_margin.joblib").exists()
+    else (LEGACY_MODEL_DIR / "catboost_h2_margin.joblib")
+)
 
 # 80% confidence interval z-score
 Z80 = 1.2815515655446004

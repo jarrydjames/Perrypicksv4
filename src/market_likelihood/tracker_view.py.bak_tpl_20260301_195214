@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+"""Discord view builder for market-implied tracking messages.
+
+Keep this separate from other Discord formatting to prevent cross-contamination
+with model-based language.
+"""
+
+from typing import Dict, Iterable
+
+from .types import StatusTier
+
+_TIER_EMOJI = {
+    StatusTier.STRONG: "🟢",
+    StatusTier.OK: "🔵",
+    StatusTier.WATCH: "🟡",
+    StatusTier.DANGER: "🟠",
+    StatusTier.EXIT: "🔴",
+}
+
+
+def _arrow(delta: float | None) -> str:
+    if delta is None:
+        return ""
+    if delta > 0:
+        return "▲"
+    if delta < 0:
+        return "▼"
+    return "→"
+
+
+def build_tracking_embed(
+    *,
+    matchup: str,
+    ticket_label: str,
+    live_label: str,
+    p_hit: float,
+    tier: StatusTier,
+    delta_2m: float | None,
+    move_pts: float | None,
+    notes: Iterable[str] = (),
+) -> Dict:
+    emoji = _TIER_EMOJI.get(tier, "⚪")
+    title = f"{emoji} Live Market Likelihood (Book-Implied)"
+
+    lines = [
+        f"**{matchup}**",
+        "",
+        f"**Ticket:** {ticket_label}",
+        f"**Live:** {live_label}",
+        "",
+        f"**Likelihood ticket wins:** {p_hit*100:.0f}%",
+    ]
+
+    if delta_2m is not None:
+        lines.append(f"**Trend (2m):** {_arrow(delta_2m)} {abs(delta_2m)*100:.0f}%")
+
+    if move_pts is not None:
+        lines.append(f"**Move vs ticket:** {move_pts:+.1f} pts")
+
+    if notes:
+        lines.append("")
+        for n in list(notes)[:4]:
+            lines.append(f"• {n}")
+
+    return {
+        "title": title,
+        "description": "\n".join(lines)[:3900],
+        "color": 0x3498DB,
+        "footer": {"text": "Local composite odds only | prototype"},
+    }
+
+
+def build_final_embed(
+    *,
+    matchup: str,
+    ticket_label: str,
+    final_score: str,
+    result: str,
+) -> Dict:
+    """Final edit when game ends."""
+
+    res = (result or "").lower().strip()
+    if res == "won":
+        emoji = "✅"
+        title = "✅ Final — WON (tracking stopped)"
+        color = 0x2ECC71
+    elif res == "push":
+        emoji = "➖"
+        title = "➖ Final — PUSH (tracking stopped)"
+        color = 0x95A5A6
+    else:
+        emoji = "❌"
+        title = "❌ Final — LOST (tracking stopped)"
+        color = 0xE74C3C
+
+    lines = [
+        f"**{matchup}**",
+        f"Final: {final_score}",
+        "",
+        f"**Ticket:** {ticket_label}",
+        f"**Result:** {emoji} {res.upper()}",
+    ]
+
+    return {
+        "title": title,
+        "description": "\n".join(lines)[:3900],
+        "color": color,
+        "footer": {"text": "tracking stopped"},
+    }

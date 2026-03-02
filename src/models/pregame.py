@@ -7,9 +7,9 @@ The pregame model predicts game outcomes before tip-off using:
 - Head-to-head history
 - Schedule features (rest, B2B)
 
-Champion Models (from comprehensive 7-model evaluation):
-- Total: Neural Network (R2: 0.592, MAE: 9.578)
-- Margin: Neural Network (R2: 0.945, MAE: 2.954)
+Champion Models:
+- Primary (v5/Maximus): CatBoost deploy models (`Maximus/models/catboost_{total,margin}.cbm`)
+- Fallback (legacy): joblib neural_network_* in `models_v3/pregame/`
 """
 
 from dataclasses import dataclass
@@ -19,6 +19,7 @@ import joblib
 import math
 import numpy as np
 import logging
+from pathlib import Path
 
 from src.modeling.base import BaseTwoHeadModel, TwoHeadFitResult
 from src.modeling.types import TrainedHead, PredictionResult
@@ -40,6 +41,7 @@ class PregameModel:
     """
 
     MODELS_DIR = Path("models_v3/pregame")
+    MAXIMUS_MODELS_DIR = Path("Maximus/models")
     TARGET_TOTAL = "total"
     TARGET_MARGIN = "margin"
 
@@ -49,14 +51,40 @@ class PregameModel:
         self.total_model = {}
         self.margin_model = {}
         self.features = []
+        self._backend: str = "unknown"  # catboost|maximus_legacy_joblib
         self.feature_version = "v4_pregame"
 
     def load_models(self) -> bool:
-        """Load trained pregame models if available."""
+        """Load trained pregame models.
+
+        Prefers v5/Maximus CatBoost deploy models if present.
+        """
         if self._loaded:
             return True
 
-        # Try neural network first (champion)
+        # --- Preferred: Maximus CatBoost deploy models ---
+        cb_total = self.MAXIMUS_MODELS_DIR / "catboost_total.cbm"
+        cb_margin = self.MAXIMUS_MODELS_DIR / "catboost_margin.cbm"
+
+        if cb_total.exists() and cb_margin.exists():
+            try:
+                from catboost import CatBoostRegressor
+                from src.data.maximus_features import maximus_feature_columns
+
+                self.features = maximus_feature_columns()  # ordered (54)
+                self.total_model = CatBoostRegressor()
+                self.total_model.load_model(str(cb_total))
+                self.margin_model = CatBoostRegressor()
+                self.margin_model.load_model(str(cb_margin))
+
+                self._backend = "catboost"
+                self._loaded = True
+                logger.info(f"Loaded MAXIMUS CatBoost models with {len(self.features)} features")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to load MAXIMUS CatBoost models: {e}. Falling back to joblib models.")
+
+        # --- Fallback: legacy joblib models ---
         total_path = self.models_dir / "neural_network_total.joblib"
         margin_path = self.models_dir / "neural_network_margin.joblib"
 
@@ -117,23 +145,37 @@ class PregameModel:
         feature_values = [features.get(f, 0.0) for f in self.features]
         X = np.array([feature_values])
 
-        # Predict total
-        total_model = self.total_model.get("model")
-        if total_model is not None:
-            total_mean = float(total_model.predict(X)[0])
-        else:
-            total_mean = 215.0  # NBA average
+        if self._backend == "catboost":
+            # CatBoostRegressor API
+            try:
+                total_mean = float(self.total_model.predict(X)[0])
+            except Exception:
+                total_mean = 215.0
 
-        # Predict margin
-        margin_model = self.margin_model.get("model")
-        if margin_model is not None:
-            margin_mean = float(margin_model.predict(X)[0])
-        else:
-            margin_mean = 0.0
+            try:
+                margin_mean = float(self.margin_model.predict(X)[0])
+            except Exception:
+                margin_mean = 0.0
 
-        # Get sigmas
-        sigma_total = self.total_model.get("residual_sigma", 15.6)
-        sigma_margin = self.margin_model.get("residual_sigma", 11.2)
+            # No baked sigma in cbm artifact. Use conservative defaults.
+            sigma_total = 15.6
+            sigma_margin = 11.2
+        else:
+            # Legacy joblib dict API
+            total_model = self.total_model.get("model")
+            if total_model is not None:
+                total_mean = float(total_model.predict(X)[0])
+            else:
+                total_mean = 215.0  # NBA average
+
+            margin_model = self.margin_model.get("model")
+            if margin_model is not None:
+                margin_mean = float(margin_model.predict(X)[0])
+            else:
+                margin_mean = 0.0
+
+            sigma_total = self.total_model.get("residual_sigma", 15.6)
+            sigma_margin = self.margin_model.get("residual_sigma", 11.2)
 
         # 80% confidence intervals (using 1.28 z-score)
         total_q10 = total_mean - 1.28 * sigma_total
@@ -158,7 +200,7 @@ class PregameModel:
             margin_q90=margin_q90,
             total_q10=total_q10,
             total_q90=total_q90,
-            model_name="pregame_neural_network",
+            model_name=("maximus_catboost" if self._backend == "catboost" else "pregame_neural_network"),
             model_version="1.0.0",
             feature_version=self.feature_version,
         )
