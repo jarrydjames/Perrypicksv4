@@ -66,6 +66,7 @@ def main() -> None:
     # Lazy imports after env load (avoid import-time side effects)
     from src.automation.pregame_cycle import PregameCycleConfig, run_pregame_cycle
     from src.automation.maximus_pregame_poster import MaximusPregamePoster
+    from src.automation.maximus_game_preview_poster import MaximusGamePreviewPoster
     from src.automation.maximus_daily_summary import MaximusDailySummaryPoster
 
     daily_cfg = MaximusDailySummaryPoster.from_env()
@@ -75,6 +76,10 @@ def main() -> None:
     poster = MaximusPregamePoster(poster_cfg)
     if poster_cfg.enabled and not poster_cfg.webhook_url:
         logger.error("Posting enabled but DISCORD_MAXIMUS_PREGAME_WEBHOOK missing (won't post)")
+
+    # Game preview poster (1-hour-before tip with updated odds)
+    preview_cfg = MaximusGamePreviewPoster.from_env()
+    preview = MaximusGamePreviewPoster(preview_cfg)
 
     while True:
         start = time.time()
@@ -88,6 +93,12 @@ def main() -> None:
                 created = run_pregame_cycle(cfg=PregameCycleConfig())
 
             posted = poster.post_pending()
+
+            # Game preview posts ~1 hour before tip with updated odds
+            preview_posted = 0
+            if preview_cfg.enabled:
+                preview_posted = preview.post_due_previews()
+
             # Only attempt daily summary when the time gate says yes (avoids needless DB/odds work).
             if daily.should_post_now(force=False):
                 summary_posted = daily.post_daily_summary(force=False)
@@ -95,9 +106,10 @@ def main() -> None:
                     logger.info("daily summary posted")
 
             logger.info(
-                "tick ok | created=%s posted=%s elapsed=%.2fs at=%s",
+                "tick ok | created=%s posted=%s preview=%s elapsed=%.2fs at=%s",
                 created,
                 posted,
+                preview_posted,
                 time.time() - start,
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             )
