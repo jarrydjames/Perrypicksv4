@@ -197,7 +197,11 @@ def check_live_games_odds() -> List[Dict[str, str]]:
         
         # Get in-progress games (same query as automation uses)
         # Games in Q3 or Q4 that are not Final
+        # AND must be from TODAY (to avoid showing old games)
+        from datetime import date
+        today_cst = date.today()
         games = db.query(Game).filter(
+            Game.game_date >= today_cst,
             Game.period >= 3,
             Game.period <= 4,
             Game.game_status != "Final",
