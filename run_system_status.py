@@ -195,12 +195,14 @@ def check_live_games_odds() -> List[Dict[str, str]]:
         
         db = SessionLocal()
         
-        # Get all active games from today (not Final)
-        # This includes scheduled, Q1, Q2, Q3, Q4, in-progress
+        # Get games in Q1-Q4 (actively playing, not pregame)
+        # Period 0 = Scheduled/Final, Period 1-4 = Q1/Q2/Q3/Q4 (in progress)
         from datetime import date
         today_cst = date.today()
         games = db.query(Game).filter(
             Game.game_date >= today_cst,
+            Game.period >= 1,
+            Game.period <= 4,
             Game.game_status != "Final",
         ).all()
         
