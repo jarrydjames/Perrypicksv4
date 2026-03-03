@@ -34,7 +34,7 @@ from src.data.pregame_features import PregameFeatureContext, build_pregame_featu
 from src.models.pregame import get_pregame_model
 from src.odds import OddsAPIError, fetch_nba_odds_snapshot
 from src.schedule import fetch_schedule
-from src.utils.league_time import league_day_str
+from src.utils.league_time import league_day_str, as_league
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +116,13 @@ def run_pregame_cycle(*, cfg: PregameCycleConfig) -> int:
         try:
             game = db.query(Game).filter(Game.nba_id == nba_id).first()
             if not game:
+                # Convert UTC to league-local naive datetime for DB storage
+                # Game.game_date is expected to be league-local (CST) naive
+                game_date_local = as_league(game_dt).replace(tzinfo=None)
+
                 game = Game(
                     nba_id=nba_id,
-                    game_date=game_dt,
+                    game_date=game_date_local,
                     home_team=home_tri,
                     away_team=away_tri,
                     home_team_name=None,
