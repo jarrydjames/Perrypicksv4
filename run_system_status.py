@@ -181,10 +181,106 @@ def check_odds_api_health() -> Tuple[bool, Optional[str]]:
         return False, str(e)
 
 
+
+def check_live_games_odds() -> List[Dict[str, str]]:
+    """Check if odds can be fetched for in-progress games.
+    
+    Returns:
+        List of dicts with game info and odds status:
+        [{"away_tri": "GSW", "home_tri": "HOU", "status": "ok/failed", "error": None}]
+    """
+    try:
+        from dashboard.backend.database import SessionLocal, Game
+        import requests
+        
+        db = SessionLocal()
+        
+        # Get in-progress games (same query as automation uses)
+        # Games in Q3 or Q4 that are not Final
+        games = db.query(Game).filter(
+            Game.period >= 3,
+            Game.period <= 4,
+            Game.game_status != "Final",
+        ).all()
+        
+        if not games:
+            db.close()
+            return []
+        
+        # Fetch all NBA odds from Odds API (single call for efficiency)
+        try:
+            response = requests.get("http://localhost:8890/v1/odds?sport=nba", timeout=5)
+            if response.status_code != 200:
+                db.close()
+                return []
+            
+            all_odds = response.json()
+            events = all_odds.get("events", [])
+            
+            # Create lookup by team tricode (home_tri, away_tri)
+            odds_lookup = {}
+            for event in events:
+                home_tri = event.get("home_tricode", "").upper()
+                away_tri = event.get("away_tricode", "").upper()
+                if home_tri and away_tri:
+                    key = (away_tri, home_tri)
+                    odds_lookup[key] = event
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch odds from API: {e}")
+            db.close()
+            return []
+        
+        games_odds_status = []
+        
+        for game in games:
+            # Try to find odds by team tricode
+            key = (game.away_team, game.home_team)
+            event = odds_lookup.get(key)
+            
+            if event:
+                # Check if we have main odds types
+                has_main_odds = False
+                bookmakers = event.get("bookmakers", [])
+                if bookmakers:
+                    markets = bookmakers[0].get("markets", {})
+                    has_moneyline = markets.get("moneyline") and (
+                        markets["moneyline"].get("home") is not None or
+                        markets["moneyline"].get("away") is not None
+                    )
+                    has_spread = markets.get("spread") and markets["spread"].get("line") is not None
+                    has_total = markets.get("total") and markets["total"].get("line") is not None
+                    
+                    has_main_odds = has_moneyline or has_spread or has_total
+                
+                games_odds_status.append({
+                    "away_tri": game.away_team,
+                    "home_tri": game.home_team,
+                    "status": "ok" if has_main_odds else "no_data",
+                    "error": None,
+                })
+            else:
+                games_odds_status.append({
+                    "away_tri": game.away_team,
+                    "home_tri": game.home_team,
+                    "status": "failed",
+                    "error": "No odds data",
+                })
+        
+        db.close()
+        return games_odds_status
+        
+    except Exception as e:
+        # If database or other error, return empty list
+        logger.error(f"Error checking live games odds: {e}")
+        return []
+
+
 def build_status_embed(
     systems_status: List[Dict],
     last_updated_cst: str,
-    current_date_cst: str
+    current_date_cst: str,
+    live_games_odds: Optional[List[Dict]] = None
 ) -> Dict:
     """Build Discord embed for system status.
     
@@ -201,6 +297,30 @@ def build_status_embed(
             status_lines.append(f"🟢 **{sys_info['name']}** - Running")
             if sys_info.get("uptime"):
                 status_lines.append(f"   ├─ Uptime: {sys_info['uptime']}")
+            
+            # Add live games odds verification for Odds API
+            if sys_info['name'] == 'Odds API' and live_games_odds:
+                status_lines.append(f"   ├─ Live Games Odds Check:")
+                if len(live_games_odds) == 0:
+                    status_lines.append(f"   │  └─ No games in progress")
+                else:
+                    for i, game_odds in enumerate(live_games_odds):
+                        is_last = i == len(live_games_odds) - 1
+                        game_str = f"{game_odds['away_tri']}@{game_odds['home_tri']}"
+                        if game_odds['status'] == 'ok':
+                            check = "✅"
+                        elif game_odds['status'] == 'no_data':
+                            check = "⚠️"  # Yellow triangle for no odds data
+                        else:
+                            check = "❌"
+                        
+                        prefix = "   │  └─" if is_last else "   │  ├─"
+                        
+                        if game_odds.get('error'):
+                            status_lines.append(f"{prefix} {check} {game_str} ({game_odds['error']})")
+                        else:
+                            status_lines.append(f"{prefix} {check} {game_str}")
+            
             running_count += 1
         else:
             status_lines.append(f"🔴 **{sys_info['name']}** - DOWN")
@@ -292,10 +412,11 @@ def update_status_message(
     systems_status: List[Dict],
     last_updated_cst: str,
     current_date_cst: str,
-    discord_client: DiscordClient
+    discord_client: DiscordClient,
+    live_games_odds: Optional[List[Dict]] = None
 ) -> bool:
     """Update the Discord status message."""
-    embed = build_status_embed(systems_status, last_updated_cst, current_date_cst)
+    embed = build_status_embed(systems_status, last_updated_cst, current_date_cst, live_games_odds)
     result = discord_client.edit_message(message_id=discord_message_id, content="", embeds=[embed])
     
     if result.success:
@@ -411,6 +532,11 @@ def main_loop(config: RunnerConfig, repo_root: Path) -> None:
                     "error": odds_error if not odds_healthy else None,
                 })
                 
+                # Check odds for live games
+                live_games_odds = []
+                if odds_healthy:
+                    live_games_odds = check_live_games_odds()
+                
                 # Update the message
                 success = update_status_message(
                     db,
@@ -418,7 +544,8 @@ def main_loop(config: RunnerConfig, repo_root: Path) -> None:
                     systems_status,
                     now_cst.strftime("%Y-%m-%d %H:%M:%S CST"),
                     now_cst.strftime("%Y-%m-%d"),
-                    discord_client
+                    discord_client,
+                    live_games_odds
                 )
                 
                 if success:
