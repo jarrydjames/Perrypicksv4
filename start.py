@@ -409,12 +409,12 @@ class PerryPicksOrchestrator:
         # Set environment to use composite provider (ESPN for pre-game, DraftKings Live for in-game)
         # This provides odds for both pre-game AND live/halftime situations
         # Pass only essential environment variables to avoid validation errors in odds_api
-env = {
+        env = {
     "PATH": os.environ.get("PATH", ""),
     "HOME": os.environ.get("HOME", ""),
     "ODDS_PROVIDER": "composite",
     "PORT": "8890",
-}
+        }
 
         # Activate venv if it exists
         venv_python = odds_api_dir / ".venv" / "bin" / "python"
